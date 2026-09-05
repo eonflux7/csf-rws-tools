@@ -19,6 +19,8 @@ public:
     void clear();
     void draw(const rws::Chunk& geometry_chunk, std::span<const std::byte> bytes,
               const std::filesystem::path& source_path);
+    void draw_scene(const std::vector<rws::Chunk>& chunks, std::span<const std::byte> bytes,
+                    const std::filesystem::path& source_path);
 
 private:
     struct Face {
@@ -28,7 +30,7 @@ private:
     struct Uv { float u{}, v{}; };
     struct GpuVertex {
         float x{}, y{}, z{};
-        float base_u{}, base_v{}, debug_u{}, debug_v{};
+        float base_u{}, base_v{}, lightmap_u{}, lightmap_v{}, debug_u{}, debug_v{};
         float nx{}, ny{}, nz{};
         std::uint32_t source_index{};
     };
@@ -39,14 +41,21 @@ private:
 
     bool load(const rws::Chunk& geometry_chunk, std::span<const std::byte> bytes,
               const std::filesystem::path& source_path);
+    bool load_scene(const std::vector<rws::Chunk>& chunks, std::span<const std::byte> bytes,
+                    const std::filesystem::path& source_path);
     void select_uv_set(std::size_t index);
     void reset_view();
+    void update_keyboard_navigation();
+    [[nodiscard]] rws::Vec3 camera_offset(float yaw, float pitch) const;
     static void render_callback(const ImDrawList*, const ImDrawCmd* command);
     void render_gpu();
     bool create_gpu_resources();
     void destroy_gpu_resources();
 
     std::uint64_t chunk_offset_{~std::uint64_t{}};
+    bool scene_mode_{};
+    std::size_t scene_clump_count_{}, scene_instance_count_{}, scene_world_sector_count_{},
+        scene_skipped_count_{};
     std::vector<rws::Vec3> vertices_;
     std::vector<std::vector<Uv>> uv_sets_;
     std::vector<Face> faces_;
@@ -66,8 +75,15 @@ private:
     float radius_{1.0F};
     float yaw_{-0.65F};
     float pitch_{-0.35F};
+    float target_yaw_{-0.65F};
+    float target_pitch_{-0.35F};
     float distance_{3.0F};
     float pan_x_{}, pan_y_{};
+    rws::Vec3 navigation_offset_{};
+    rws::Vec3 target_navigation_offset_{};
+    bool preserve_camera_position_{};
+    float navigation_speed_{1.0F};
+    float lightmap_intensity_{2.0F};
     float canvas_x_{}, canvas_y_{}, canvas_width_{}, canvas_height_{};
     int view_style_{};
     std::size_t selected_uv_set_{};

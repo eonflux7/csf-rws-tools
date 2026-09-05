@@ -200,6 +200,10 @@ vertex 2 rather than the in-memory `RpTriangle` order. Both candidate arrangemen
 were range-tested against vertex/material counts: all 369 ST05 geometries uniquely
 select the streamed arrangement, with zero memory-order or ambiguous cases.
 
+World Sector triangles retain the in-memory order instead: vertex 0, vertex 1,
+vertex 2, material. In ST05, the third word spans each sector's full vertex range,
+while the fourth word is bounded by the World's 339 materials.
+
 The OBJ exporter uses the first morph target that contains positions, the first UV
 set, optional normals, the validated streamed triangles, and `material_N` groups.
 Geometry is currently exported in its local frame; applying Frame List transforms
@@ -218,11 +222,11 @@ and extracting texture images remain future work.
 - The region is 14,458,929 bytes and contains embedded ordinary chunk headers,
   transforms, numeric IDs, and length-prefixed names such as `ARBOL_3`.
 
-Interpretation: the tail is not a plain sibling chunk stream. It is likely an
-instance/scene table whose records embed RenderWare subobjects. Treating every
-12-byte-looking sequence as a chunk creates false positives, so the current parser
-stops the top-level tree after the first incompatible boundary and preserves the
-entire tail as opaque bytes.
+The tail begins with 23 `ARBOL_3` instance records containing embedded Matrix
+chunks. At `0x00DD9BA2` they are followed by a standard RenderWare World chunk that
+extends to physical EOF (its declared size overruns the file by 32 bytes). The
+parser conservatively recovers this World when its stamp, leading Struct child, and
+EOF boundary all agree; the preceding instance records remain opaque.
 
 ### `ST05_COL.rws`
 

@@ -45,6 +45,7 @@ using Uniform2fProc = void (APIENTRY*)(GLint, GLfloat, GLfloat);
 using Uniform3fProc = void (APIENTRY*)(GLint, GLfloat, GLfloat, GLfloat);
 using Uniform4fProc = void (APIENTRY*)(GLint, GLfloat, GLfloat, GLfloat, GLfloat);
 using ActiveTextureProc = void (APIENTRY*)(GLenum);
+using GenerateMipmapProc = void (APIENTRY*)(GLenum);
 
 constexpr GLenum gl_vertex_shader = 0x8B31;
 constexpr GLenum gl_fragment_shader = 0x8B30;
@@ -54,6 +55,8 @@ constexpr GLenum gl_array_buffer = 0x8892;
 constexpr GLenum gl_static_draw = 0x88E4;
 constexpr GLenum gl_texture0 = 0x84C0;
 constexpr GLenum gl_texture1 = gl_texture0 + 1;
+constexpr GLenum gl_texture_max_anisotropy = 0x84FE;
+constexpr GLenum gl_max_texture_max_anisotropy = 0x84FF;
 
 struct GlApi {
     CreateShaderProc create_shader{};
@@ -85,6 +88,7 @@ struct GlApi {
     Uniform3fProc uniform_3f{};
     Uniform4fProc uniform_4f{};
     ActiveTextureProc active_texture{};
+    GenerateMipmapProc generate_mipmap{};
 
     bool load() {
 #define LOAD_GL(member, name) member = reinterpret_cast<decltype(member)>(glfwGetProcAddress(name)); if (!member) return false
@@ -117,10 +121,50 @@ struct GlApi {
         LOAD_GL(uniform_3f, "glUniform3f");
         LOAD_GL(uniform_4f, "glUniform4f");
         LOAD_GL(active_texture, "glActiveTexture");
+        LOAD_GL(generate_mipmap, "glGenerateMipmap");
 #undef LOAD_GL
         return true;
     }
 };
+
+struct AffineTransform {
+    std::array<float, 9> rotation{1, 0, 0, 0, 1, 0, 0, 0, 1};
+    rws::Vec3 position{};
+};
+
+AffineTransform frame_transform(const rws::FrameInfo& frame) {
+    // RwMatrix stores right/up/at vectors; convert those basis columns to a
+    // conventional row-major matrix for point multiplication below.
+    return {{{frame.rotation[0], frame.rotation[3], frame.rotation[6],
+              frame.rotation[1], frame.rotation[4], frame.rotation[7],
+              frame.rotation[2], frame.rotation[5], frame.rotation[8]}}, frame.position};
+}
+
+rws::Vec3 rotate(const AffineTransform& transform, const rws::Vec3 value) {
+    const auto& m = transform.rotation;
+    return {m[0] * value.x + m[1] * value.y + m[2] * value.z,
+            m[3] * value.x + m[4] * value.y + m[5] * value.z,
+            m[6] * value.x + m[7] * value.y + m[8] * value.z};
+}
+
+rws::Vec3 transform_point(const AffineTransform& transform, const rws::Vec3 value) {
+    const auto rotated = rotate(transform, value);
+    return {rotated.x + transform.position.x, rotated.y + transform.position.y,
+            rotated.z + transform.position.z};
+}
+
+AffineTransform compose(const AffineTransform& parent, const AffineTransform& local) {
+    AffineTransform result;
+    for (unsigned row = 0; row < 3; ++row)
+        for (unsigned column = 0; column < 3; ++column) {
+            result.rotation[row * 3 + column] = 0.0F;
+            for (unsigned k = 0; k < 3; ++k)
+                result.rotation[row * 3 + column] +=
+                    parent.rotation[row * 3 + k] * local.rotation[k * 3 + column];
+        }
+    result.position = transform_point(parent, local.position);
+    return result;
+}
 
 GlApi& gl_api() {
     static GlApi api;
@@ -134,6 +178,19 @@ float read_f32(const std::span<const std::byte> bytes, const std::uint64_t offse
     for (unsigned i = 0; i < 4; ++i)
         raw |= std::to_integer<std::uint32_t>(bytes[static_cast<std::size_t>(offset + i)]) << (i * 8U);
     return std::bit_cast<float>(raw);
+}
+
+std::uint32_t read_span_u32(const std::span<const std::byte> bytes, const std::uint64_t offset) {
+    std::uint32_t result{};
+    for (unsigned i = 0; i < 4; ++i)
+        result |= std::to_integer<std::uint32_t>(bytes[static_cast<std::size_t>(offset + i)]) << (i * 8U);
+    return result;
+}
+
+std::uint16_t read_span_u16(const std::span<const std::byte> bytes, const std::uint64_t offset) {
+    return static_cast<std::uint16_t>(
+        std::to_integer<std::uint16_t>(bytes[static_cast<std::size_t>(offset)]) |
+        (std::to_integer<std::uint16_t>(bytes[static_cast<std::size_t>(offset + 1)]) << 8U));
 }
 
 ImU32 material_color(const std::uint16_t material, const float shade) {
@@ -242,14 +299,22 @@ bool decode_dds(const std::filesystem::path& path, int& width, int& height,
 
 unsigned int upload_texture(const int width, const int height, const std::uint8_t* rgba) {
     GLuint texture{};
+    auto& gl = gl_api();
     glGenTextures(1, &texture);
     glBindTexture(GL_TEXTURE_2D, texture);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+                    gl.generate_mipmap ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    GLfloat maximum_anisotropy = 1.0F;
+    glGetFloatv(gl_max_texture_max_anisotropy, &maximum_anisotropy);
+    if (maximum_anisotropy > 1.0F)
+        glTexParameterf(GL_TEXTURE_2D, gl_texture_max_anisotropy,
+                        std::min(maximum_anisotropy, 8.0F));
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+    if (gl.generate_mipmap) gl.generate_mipmap(GL_TEXTURE_2D);
     return texture;
 }
 
@@ -275,6 +340,8 @@ void GeometryPreview::clear() {
         glDeleteTextures(static_cast<GLsizei>(owned_texture_ids_.size()), owned_texture_ids_.data());
     if (checker_texture_ != 0) glDeleteTextures(1, &checker_texture_);
     chunk_offset_ = ~std::uint64_t{};
+    scene_mode_ = false;
+    scene_clump_count_ = scene_instance_count_ = scene_world_sector_count_ = scene_skipped_count_ = 0;
     vertices_.clear();
     uv_sets_.clear();
     faces_.clear();
@@ -312,15 +379,82 @@ void GeometryPreview::select_uv_set(const std::size_t index) {
 
 void GeometryPreview::reset_view() {
     yaw_ = -0.65F;
-    pitch_ = -0.35F;
+    pitch_ = scene_mode_ ? 0.35F : -0.35F;
+    target_yaw_ = yaw_;
+    target_pitch_ = pitch_;
     distance_ = std::max(radius_ * 3.0F, 0.01F);
     pan_x_ = pan_y_ = 0.0F;
+    navigation_offset_ = {};
+    target_navigation_offset_ = {};
+    preserve_camera_position_ = false;
+}
+
+rws::Vec3 GeometryPreview::camera_offset(const float yaw, const float pitch) const {
+    const float cy = std::cos(yaw), sy = std::sin(yaw);
+    const float cp = std::cos(pitch), sp = std::sin(pitch);
+    return scene_mode_ ? rws::Vec3{cp * sy * distance_, sp * distance_, cp * cy * distance_} :
+                         rws::Vec3{cp * sy * distance_, cp * cy * distance_, sp * distance_};
+}
+
+void GeometryPreview::update_keyboard_navigation() {
+    const auto& io = ImGui::GetIO();
+    const bool hovered = ImGui::IsItemHovered();
+    const bool fast = hovered &&
+        (ImGui::IsKeyDown(ImGuiKey_LeftShift) || ImGui::IsKeyDown(ImGuiKey_RightShift));
+    // Distance-scaled movement gives level overview speed while zoomed out and
+    // precise building/interior movement up close. Keep only a tiny world-scale
+    // floor so a near-zero camera distance can never stall navigation entirely.
+    const float speed_floor = scene_mode_ ? radius_ * 0.00005F : radius_ * 0.002F;
+    const float speed = std::max(distance_ * 0.35F, std::max(speed_floor, 0.01F)) *
+        navigation_speed_ * (fast ? 4.0F : 1.0F) * io.DeltaTime;
+    const float cy = std::cos(yaw_), sy = std::sin(yaw_);
+    const rws::Vec3 forward = scene_mode_ ? rws::Vec3{-sy, 0.0F, -cy} :
+                                                   rws::Vec3{-sy, -cy, 0.0F};
+    const rws::Vec3 right = scene_mode_ ? rws::Vec3{cy, 0.0F, -sy} :
+                                                 rws::Vec3{cy, -sy, 0.0F};
+    auto move = [&](const rws::Vec3 direction, const float amount) {
+        target_navigation_offset_.x += direction.x * amount;
+        target_navigation_offset_.y += direction.y * amount;
+        target_navigation_offset_.z += direction.z * amount;
+    };
+    if (hovered && ImGui::IsKeyDown(ImGuiKey_W)) move(forward, speed);
+    if (hovered && ImGui::IsKeyDown(ImGuiKey_S)) move(forward, -speed);
+    if (hovered && ImGui::IsKeyDown(ImGuiKey_D)) move(right, speed);
+    if (hovered && ImGui::IsKeyDown(ImGuiKey_A)) move(right, -speed);
+    const rws::Vec3 up = scene_mode_ ? rws::Vec3{0, 1, 0} : rws::Vec3{0, 0, 1};
+    if (hovered && ImGui::IsKeyDown(ImGuiKey_E)) move(up, speed);
+    if (hovered && ImGui::IsKeyDown(ImGuiKey_Q)) move(up, -speed);
+
+    const float rotation_alpha = 1.0F - std::exp(-18.0F * std::min(io.DeltaTime, 0.1F));
+    const auto old_camera_offset = camera_offset(yaw_, pitch_);
+    yaw_ += (target_yaw_ - yaw_) * rotation_alpha;
+    pitch_ += (target_pitch_ - pitch_) * rotation_alpha;
+    if (preserve_camera_position_) {
+        const auto new_camera_offset = camera_offset(yaw_, pitch_);
+        const rws::Vec3 correction{old_camera_offset.x - new_camera_offset.x,
+                                  old_camera_offset.y - new_camera_offset.y,
+                                  old_camera_offset.z - new_camera_offset.z};
+        navigation_offset_.x += correction.x;
+        navigation_offset_.y += correction.y;
+        navigation_offset_.z += correction.z;
+        target_navigation_offset_.x += correction.x;
+        target_navigation_offset_.y += correction.y;
+        target_navigation_offset_.z += correction.z;
+        if (std::abs(target_yaw_ - yaw_) < 0.0001F &&
+            std::abs(target_pitch_ - pitch_) < 0.0001F)
+            preserve_camera_position_ = false;
+    }
+    const float movement_alpha = 1.0F - std::exp(-12.0F * std::min(io.DeltaTime, 0.1F));
+    navigation_offset_.x += (target_navigation_offset_.x - navigation_offset_.x) * movement_alpha;
+    navigation_offset_.y += (target_navigation_offset_.y - navigation_offset_.y) * movement_alpha;
+    navigation_offset_.z += (target_navigation_offset_.z - navigation_offset_.z) * movement_alpha;
 }
 
 bool GeometryPreview::load(const rws::Chunk& geometry_chunk,
                            const std::span<const std::byte> bytes,
                            const std::filesystem::path& source_path) {
     clear();
+    scene_mode_ = false;
     chunk_offset_ = geometry_chunk.offset;
     const auto geometry = rws::decode_geometry(geometry_chunk, bytes);
     if (!geometry) { error_ = geometry.error; return false; }
@@ -344,7 +478,10 @@ bool GeometryPreview::load(const rws::Chunk& geometry_chunk,
             uv_set.reserve(static_cast<std::size_t>(geometry.value->vertex_count));
             for (std::int32_t i = 0; i < geometry.value->vertex_count; ++i) {
                 const auto offset = uv_offset + static_cast<std::uint64_t>(i) * 8U;
-                uv_set.push_back({read_f32(bytes, offset), 1.0F - read_f32(bytes, offset + 4)});
+                // RenderWare's PC UVs and DDS images both use a top-left origin. DDS rows are
+                // uploaded unchanged, so retaining V preserves the original pairing. Flipping
+                // only the coordinates mirrors atlas islands into unrelated lightmap regions.
+                uv_set.push_back({read_f32(bytes, offset), read_f32(bytes, offset + 4)});
             }
             uv_sets_.push_back(std::move(uv_set));
         }
@@ -496,14 +633,416 @@ bool GeometryPreview::load(const rws::Chunk& geometry_chunk,
         for (const auto index : indices) {
             const auto base_uv = !uv_sets_.empty() && index < uv_sets_.front().size() ?
                 uv_sets_.front()[index] : Uv{};
+            const auto lightmap_uv = uv_sets_.size() > 1 && index < uv_sets_[1].size() ?
+                uv_sets_[1][index] : Uv{};
             const auto debug_uv = selected_uv_set_ < uv_sets_.size() &&
                 index < uv_sets_[selected_uv_set_].size() ? uv_sets_[selected_uv_set_][index] : Uv{};
             const auto& vertex = vertices_[index];
             gpu_vertices_.push_back({vertex.x, vertex.y, vertex.z,
-                base_uv.u, base_uv.v, debug_uv.u, debug_uv.v, nx, ny, nz, index});
+                base_uv.u, base_uv.v, lightmap_uv.u, lightmap_uv.v,
+                debug_uv.u, debug_uv.v, nx, ny, nz, index});
         }
         draw_batches_.back().count += 3;
     }
+    if (!create_gpu_resources()) return false;
+    reset_view();
+    return true;
+}
+
+bool GeometryPreview::load_scene(const std::vector<rws::Chunk>& chunks,
+                                 const std::span<const std::byte> bytes,
+                                 const std::filesystem::path& source_path) {
+    clear();
+    scene_mode_ = true;
+    view_style_ = 1;
+    wireframe_ = false;
+
+    rws::Vec3 minimum{std::numeric_limits<float>::max(), std::numeric_limits<float>::max(),
+                      std::numeric_limits<float>::max()};
+    rws::Vec3 maximum{-minimum.x, -minimum.y, -minimum.z};
+    std::unordered_map<std::string, unsigned int> texture_cache;
+    auto load_texture = [&](const std::string& name) -> unsigned int {
+        if (name.empty()) return 0;
+        if (const auto cached = texture_cache.find(name); cached != texture_cache.end())
+            return cached->second;
+        const auto path = find_texture(source_path, name);
+        if (path.empty()) {
+            ++missing_texture_count_;
+            if (texture_status_.empty()) texture_status_ = "Could not locate " + name + ".dds";
+            return 0;
+        }
+        int width{}, height{};
+        std::vector<std::uint8_t> rgba;
+        std::string texture_error;
+        if (!decode_dds(path, width, height, rgba, texture_error)) {
+            ++missing_texture_count_;
+            if (texture_status_.empty()) texture_status_ = std::move(texture_error);
+            return 0;
+        }
+        const auto id = upload_texture(width, height, rgba.data());
+        owned_texture_ids_.push_back(id);
+        texture_cache.emplace(name, id);
+        ++loaded_texture_count_;
+        return id;
+    };
+
+    for (const auto& clump_chunk : chunks) {
+        if (clump_chunk.type != 0x10) continue;
+        ++scene_clump_count_;
+        const auto* frame_list_chunk = rws::find_child(clump_chunk, 0x0E);
+        const auto* geometry_list_chunk = rws::find_child(clump_chunk, 0x1A);
+        if (!frame_list_chunk || !geometry_list_chunk) {
+            ++scene_skipped_count_;
+            continue;
+        }
+        const auto frames = rws::decode_frame_list(*frame_list_chunk, bytes);
+        if (!frames) {
+            ++scene_skipped_count_;
+            continue;
+        }
+        std::vector<const rws::Chunk*> geometries;
+        for (const auto& child : geometry_list_chunk->children)
+            if (child.type == 0x0F) geometries.push_back(&child);
+
+        std::vector<AffineTransform> world_frames(frames.value->frames.size());
+        std::vector<std::uint8_t> frame_state(frames.value->frames.size());
+        auto resolve_frame = [&](auto&& self, const std::size_t index) -> bool {
+            if (index >= world_frames.size()) return false;
+            if (frame_state[index] == 2) return true;
+            if (frame_state[index] == 1) return false;
+            frame_state[index] = 1;
+            const auto& frame = frames.value->frames[index];
+            const auto local = frame_transform(frame);
+            if (frame.parent >= 0) {
+                const auto parent = static_cast<std::size_t>(frame.parent);
+                if (!self(self, parent)) return false;
+                world_frames[index] = compose(world_frames[parent], local);
+            } else {
+                world_frames[index] = local;
+            }
+            frame_state[index] = 2;
+            return true;
+        };
+
+        for (const auto& atomic_chunk : clump_chunk.children) {
+            if (atomic_chunk.type != 0x14) continue;
+            const auto atomic = rws::decode_atomic(atomic_chunk, bytes);
+            if (!atomic || atomic.value->frame_index < 0 || atomic.value->geometry_index < 0 ||
+                static_cast<std::size_t>(atomic.value->geometry_index) >= geometries.size() ||
+                !resolve_frame(resolve_frame, static_cast<std::size_t>(atomic.value->frame_index))) {
+                ++scene_skipped_count_;
+                continue;
+            }
+            const auto geometry = rws::decode_geometry(
+                *geometries[static_cast<std::size_t>(atomic.value->geometry_index)], bytes);
+            if (!geometry || geometry.value->triangle_layout == rws::TriangleLayout::unknown) {
+                ++scene_skipped_count_;
+                continue;
+            }
+            const auto& geometry_chunk = *geometries[static_cast<std::size_t>(atomic.value->geometry_index)];
+            const auto* material_list_chunk = rws::find_child(geometry_chunk, 0x08);
+            const auto material_list = material_list_chunk ?
+                rws::decode_material_list(*material_list_chunk, bytes) : rws::DecodeResult<rws::MaterialListInfo>{};
+            const std::size_t material_base = material_colors_.size();
+            const auto material_count = material_list && material_list.value->material_count > 0 ?
+                static_cast<std::size_t>(material_list.value->material_count) : 1U;
+            material_colors_.resize(material_base + material_count, {190, 190, 190, 255});
+            material_textures_.resize(material_base + material_count);
+            material_lightmap_textures_.resize(material_base + material_count);
+            material_texture_names_.resize(material_base + material_count);
+            material_lightmap_texture_names_.resize(material_base + material_count);
+            if (material_list_chunk && material_list) {
+                std::vector<const rws::Chunk*> material_chunks;
+                for (const auto& child : material_list_chunk->children)
+                    if (child.type == 0x07) material_chunks.push_back(&child);
+                std::size_t next_material{};
+                for (std::size_t slot = 0; slot < material_count; ++slot) {
+                    const auto destination = material_base + slot;
+                    const auto remap = slot < material_list.value->remap.size() ?
+                        material_list.value->remap[slot] : -1;
+                    if (remap >= 0 && static_cast<std::size_t>(remap) < slot) {
+                        const auto source = material_base + static_cast<std::size_t>(remap);
+                        material_colors_[destination] = material_colors_[source];
+                        material_textures_[destination] = material_textures_[source];
+                        material_lightmap_textures_[destination] = material_lightmap_textures_[source];
+                        material_texture_names_[destination] = material_texture_names_[source];
+                        material_lightmap_texture_names_[destination] = material_lightmap_texture_names_[source];
+                        continue;
+                    }
+                    if (next_material >= material_chunks.size()) continue;
+                    const auto& material_chunk = *material_chunks[next_material++];
+                    const auto material = rws::decode_material(material_chunk, bytes);
+                    if (material) material_colors_[destination] = material.value->color;
+                    if (const auto* texture_chunk = rws::find_child(material_chunk, 0x06)) {
+                        const auto texture = rws::decode_texture(*texture_chunk, bytes);
+                        if (texture && !texture.value->name.empty()) {
+                            material_texture_names_[destination] = texture.value->name;
+                            material_textures_[destination] = load_texture(texture.value->name);
+                        }
+                    }
+                    const auto* extension = rws::find_child(material_chunk, 0x03);
+                    const auto* effects_chunk = extension ? rws::find_child(*extension, 0x120) : nullptr;
+                    if (effects_chunk) {
+                        const auto effects = rws::decode_material_effects(*effects_chunk, 0x07, bytes);
+                        if (effects && effects.value->has_dual_texture &&
+                            !effects.value->dual_texture.name.empty()) {
+                            material_lightmap_texture_names_[destination] = effects.value->dual_texture.name;
+                            material_lightmap_textures_[destination] = load_texture(effects.value->dual_texture.name);
+                        }
+                    }
+                }
+            }
+            const auto morph = std::find_if(geometry.value->morph_targets.begin(),
+                geometry.value->morph_targets.end(), [](const rws::MorphTargetInfo& value) {
+                    return value.has_vertices;
+                });
+            if (morph == geometry.value->morph_targets.end()) {
+                ++scene_skipped_count_;
+                continue;
+            }
+            const auto& transform = world_frames[static_cast<std::size_t>(atomic.value->frame_index)];
+            std::vector<Uv> base_uvs, lightmap_uvs;
+            if (!geometry.value->texcoord_offsets.empty()) {
+                base_uvs.reserve(static_cast<std::size_t>(geometry.value->vertex_count));
+                const auto offset = geometry.value->texcoord_offsets[0];
+                for (std::int32_t i = 0; i < geometry.value->vertex_count; ++i)
+                    base_uvs.push_back({read_f32(bytes, offset + static_cast<std::uint64_t>(i) * 8U),
+                        read_f32(bytes, offset + static_cast<std::uint64_t>(i) * 8U + 4)});
+            }
+            if (geometry.value->texcoord_offsets.size() > 1) {
+                lightmap_uvs.reserve(static_cast<std::size_t>(geometry.value->vertex_count));
+                const auto offset = geometry.value->texcoord_offsets[1];
+                for (std::int32_t i = 0; i < geometry.value->vertex_count; ++i)
+                    lightmap_uvs.push_back({read_f32(bytes, offset + static_cast<std::uint64_t>(i) * 8U),
+                        read_f32(bytes, offset + static_cast<std::uint64_t>(i) * 8U + 4)});
+            }
+            std::vector<rws::Vec3> instance_vertices;
+            instance_vertices.reserve(static_cast<std::size_t>(geometry.value->vertex_count));
+            for (std::int32_t i = 0; i < geometry.value->vertex_count; ++i) {
+                const auto offset = morph->vertices_offset + static_cast<std::uint64_t>(i) * 12U;
+                const auto vertex = transform_point(transform,
+                    {read_f32(bytes, offset), read_f32(bytes, offset + 4), read_f32(bytes, offset + 8)});
+                instance_vertices.push_back(vertex);
+                vertices_.push_back(vertex);
+                minimum.x = std::min(minimum.x, vertex.x); minimum.y = std::min(minimum.y, vertex.y);
+                minimum.z = std::min(minimum.z, vertex.z); maximum.x = std::max(maximum.x, vertex.x);
+                maximum.y = std::max(maximum.y, vertex.y); maximum.z = std::max(maximum.z, vertex.z);
+            }
+            std::vector<rws::TriangleInfo> triangles;
+            triangles.reserve(static_cast<std::size_t>(geometry.value->triangle_count));
+            for (std::int32_t i = 0; i < geometry.value->triangle_count; ++i) {
+                const auto decoded_triangle = rws::decode_triangle(*geometry.value, i, bytes);
+                if (decoded_triangle) triangles.push_back(*decoded_triangle.value);
+            }
+            std::stable_sort(triangles.begin(), triangles.end(), [](const auto& left, const auto& right) {
+                return left.material < right.material;
+            });
+            for (const auto& triangle : triangles) {
+                if (triangle.vertices[0] >= instance_vertices.size() ||
+                    triangle.vertices[1] >= instance_vertices.size() ||
+                    triangle.vertices[2] >= instance_vertices.size()) continue;
+                const auto local_material = std::min<std::size_t>(triangle.material, material_count - 1);
+                const auto global_material = material_base + local_material;
+                if (draw_batches_.empty() || draw_batches_.back().material != global_material)
+                    draw_batches_.push_back({static_cast<std::uint16_t>(global_material),
+                        static_cast<std::uint32_t>(gpu_vertices_.size()), 0});
+                const auto& a = instance_vertices[triangle.vertices[0]];
+                const auto& b = instance_vertices[triangle.vertices[1]];
+                const auto& c = instance_vertices[triangle.vertices[2]];
+                float nx = (b.y - a.y) * (c.z - a.z) - (b.z - a.z) * (c.y - a.y);
+                float ny = (b.z - a.z) * (c.x - a.x) - (b.x - a.x) * (c.z - a.z);
+                float nz = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+                const float length = std::sqrt(nx * nx + ny * ny + nz * nz);
+                if (length > 0.0F) { nx /= length; ny /= length; nz /= length; }
+                for (const auto index : triangle.vertices) {
+                    const auto* vertex = &instance_vertices[index];
+                    const auto base_uv = index < base_uvs.size() ? base_uvs[index] : Uv{};
+                    const auto lightmap_uv = index < lightmap_uvs.size() ? lightmap_uvs[index] : Uv{};
+                    gpu_vertices_.push_back({vertex->x, vertex->y, vertex->z,
+                        base_uv.u, base_uv.v, lightmap_uv.u, lightmap_uv.v,
+                        lightmap_uv.u, lightmap_uv.v, nx, ny, nz, index});
+                }
+                faces_.push_back({});
+                draw_batches_.back().count += 3;
+            }
+            if (!triangles.empty()) {
+                ++scene_instance_count_;
+            }
+        }
+    }
+
+    // CSF stores the terrain as a RenderWare World after its small custom
+    // instance prefix. Document recovery exposes the World itself, while its
+    // historically short sector/plugin payloads make declared-size BSP walking
+    // unreliable. Locate leaves by their fully validated Struct layouts.
+    const auto world_chunk = std::find_if(chunks.begin(), chunks.end(), [](const rws::Chunk& chunk) {
+        return chunk.type == 0x0B;
+    });
+    if (world_chunk != chunks.end()) {
+        const auto world = rws::decode_world(*world_chunk, bytes);
+        if (world) {
+            const auto* material_list_chunk = rws::find_child(*world_chunk, 0x08);
+            const auto material_list = material_list_chunk ?
+                rws::decode_material_list(*material_list_chunk, bytes) : rws::DecodeResult<rws::MaterialListInfo>{};
+            const std::size_t material_base = material_colors_.size();
+            const auto material_count = material_list && material_list.value->material_count > 0 ?
+                static_cast<std::size_t>(material_list.value->material_count) : 1U;
+            material_colors_.resize(material_base + material_count, {155, 158, 150, 255});
+            material_textures_.resize(material_base + material_count);
+            material_lightmap_textures_.resize(material_base + material_count);
+            material_texture_names_.resize(material_base + material_count);
+            material_lightmap_texture_names_.resize(material_base + material_count);
+            if (material_list_chunk && material_list) {
+                std::vector<const rws::Chunk*> materials;
+                for (const auto& child : material_list_chunk->children)
+                    if (child.type == 0x07) materials.push_back(&child);
+                std::size_t next_material{};
+                for (std::size_t slot = 0; slot < material_count; ++slot) {
+                    const auto destination = material_base + slot;
+                    const auto remap = material_list.value->remap[slot];
+                    if (remap >= 0 && static_cast<std::size_t>(remap) < slot) {
+                        const auto source = material_base + static_cast<std::size_t>(remap);
+                        material_colors_[destination] = material_colors_[source];
+                        material_textures_[destination] = material_textures_[source];
+                        material_lightmap_textures_[destination] = material_lightmap_textures_[source];
+                        material_texture_names_[destination] = material_texture_names_[source];
+                        material_lightmap_texture_names_[destination] = material_lightmap_texture_names_[source];
+                        continue;
+                    }
+                    if (next_material >= materials.size()) continue;
+                    const auto& material_chunk = *materials[next_material++];
+                    const auto material = rws::decode_material(material_chunk, bytes);
+                    if (material) material_colors_[destination] = material.value->color;
+                    if (const auto* texture_chunk = rws::find_child(material_chunk, 0x06)) {
+                        const auto texture = rws::decode_texture(*texture_chunk, bytes);
+                        if (texture && !texture.value->name.empty()) {
+                            material_texture_names_[destination] = texture.value->name;
+                            material_textures_[destination] = load_texture(texture.value->name);
+                        }
+                    }
+                    const auto* extension = rws::find_child(material_chunk, 0x03);
+                    const auto* effects_chunk = extension ? rws::find_child(*extension, 0x120) : nullptr;
+                    if (effects_chunk) {
+                        const auto effects = rws::decode_material_effects(*effects_chunk, 0x07, bytes);
+                        if (effects && effects.value->has_dual_texture &&
+                            !effects.value->dual_texture.name.empty()) {
+                            material_lightmap_texture_names_[destination] = effects.value->dual_texture.name;
+                            material_lightmap_textures_[destination] = load_texture(effects.value->dual_texture.name);
+                        }
+                    }
+                }
+            }
+
+            std::uint32_t uv_sets = (world.value->format >> 16U) & 0xFFU;
+            if (uv_sets == 0) uv_sets = (world.value->format & 0x80U) ? 2U :
+                ((world.value->format & 0x04U) ? 1U : 0U);
+            const auto scan_end = world_chunk->payload_offset + world_chunk->available_size;
+            for (std::uint64_t candidate = world_chunk->payload_offset;
+                 candidate + 36U <= scan_end; ++candidate) {
+                if (read_span_u32(bytes, candidate) != 0x09 ||
+                    read_span_u32(bytes, candidate + 8) != world_chunk->library_id ||
+                    read_span_u32(bytes, candidate + 12) != 0x01 ||
+                    read_span_u32(bytes, candidate + 20) != world_chunk->library_id)
+                    continue;
+                const auto struct_size = static_cast<std::uint64_t>(read_span_u32(bytes, candidate + 16));
+                const auto data = candidate + 24U;
+                if (struct_size < 44 || data + struct_size > scan_end) continue;
+                const auto triangle_count = static_cast<std::int32_t>(read_span_u32(bytes, data + 4));
+                const auto vertex_count = static_cast<std::int32_t>(read_span_u32(bytes, data + 8));
+                if (triangle_count < 0 || vertex_count < 0) continue;
+                const auto vertices_size = static_cast<std::uint64_t>(vertex_count) * 12U;
+                const auto normals_size = (world.value->format & 0x10U) ?
+                    static_cast<std::uint64_t>(vertex_count) * 4U : 0U;
+                const auto prelight_size = (world.value->format & 0x08U) ?
+                    static_cast<std::uint64_t>(vertex_count) * 4U : 0U;
+                const auto uv_size = static_cast<std::uint64_t>(uv_sets) *
+                    static_cast<std::uint64_t>(vertex_count) * 8U;
+                const auto triangles_size = static_cast<std::uint64_t>(triangle_count) * 8U;
+                if (44U + vertices_size + normals_size + prelight_size + uv_size + triangles_size != struct_size)
+                    continue;
+
+                const auto vertices_offset = data + 44U;
+                const auto uv_offset = vertices_offset + vertices_size + normals_size + prelight_size;
+                const auto triangles_offset = uv_offset + uv_size;
+                const auto material_window = static_cast<std::int32_t>(read_span_u32(bytes, data));
+                std::vector<rws::Vec3> sector_vertices;
+                sector_vertices.reserve(static_cast<std::size_t>(vertex_count));
+                for (std::int32_t i = 0; i < vertex_count; ++i) {
+                    const auto offset = vertices_offset + static_cast<std::uint64_t>(i) * 12U;
+                    const rws::Vec3 vertex{read_f32(bytes, offset), read_f32(bytes, offset + 4),
+                                           read_f32(bytes, offset + 8)};
+                    sector_vertices.push_back(vertex);
+                    vertices_.push_back(vertex);
+                    minimum.x = std::min(minimum.x, vertex.x); minimum.y = std::min(minimum.y, vertex.y);
+                    minimum.z = std::min(minimum.z, vertex.z); maximum.x = std::max(maximum.x, vertex.x);
+                    maximum.y = std::max(maximum.y, vertex.y); maximum.z = std::max(maximum.z, vertex.z);
+                }
+                struct SectorTriangle { std::array<std::uint16_t, 3> vertices; std::uint16_t material; };
+                std::vector<SectorTriangle> sector_triangles;
+                sector_triangles.reserve(static_cast<std::size_t>(triangle_count));
+                for (std::int32_t i = 0; i < triangle_count; ++i) {
+                    const auto offset = triangles_offset + static_cast<std::uint64_t>(i) * 8U;
+                    const std::array words{read_span_u16(bytes, offset), read_span_u16(bytes, offset + 2),
+                                           read_span_u16(bytes, offset + 4), read_span_u16(bytes, offset + 6)};
+                    // World Sectors retain the in-memory RpTriangle order. This
+                    // differs from the streamed order used by Geometry chunks.
+                    sector_triangles.push_back({{words[0], words[1], words[2]}, words[3]});
+                }
+                std::stable_sort(sector_triangles.begin(), sector_triangles.end(),
+                    [](const auto& left, const auto& right) { return left.material < right.material; });
+                for (const auto& triangle : sector_triangles) {
+                    if (triangle.vertices[0] >= sector_vertices.size() ||
+                        triangle.vertices[1] >= sector_vertices.size() ||
+                        triangle.vertices[2] >= sector_vertices.size()) continue;
+                    const auto local_material = std::clamp<std::int64_t>(
+                        static_cast<std::int64_t>(material_window) + triangle.material,
+                        0, static_cast<std::int64_t>(material_count - 1));
+                    const auto global_material = material_base + static_cast<std::size_t>(local_material);
+                    if (draw_batches_.empty() || draw_batches_.back().material != global_material)
+                        draw_batches_.push_back({static_cast<std::uint16_t>(global_material),
+                            static_cast<std::uint32_t>(gpu_vertices_.size()), 0});
+                    const auto& a = sector_vertices[triangle.vertices[0]];
+                    const auto& b = sector_vertices[triangle.vertices[1]];
+                    const auto& c = sector_vertices[triangle.vertices[2]];
+                    float nx = (b.y - a.y) * (c.z - a.z) - (b.z - a.z) * (c.y - a.y);
+                    float ny = (b.z - a.z) * (c.x - a.x) - (b.x - a.x) * (c.z - a.z);
+                    float nz = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+                    const float length = std::sqrt(nx * nx + ny * ny + nz * nz);
+                    if (length > 0.0F) { nx /= length; ny /= length; nz /= length; }
+                    for (const auto index : triangle.vertices) {
+                        const auto& vertex = sector_vertices[index];
+                        const auto base = uv_sets > 0 ? uv_offset + static_cast<std::uint64_t>(index) * 8U : 0U;
+                        const auto lightmap = uv_sets > 1 ? uv_offset +
+                            static_cast<std::uint64_t>(vertex_count) * 8U +
+                            static_cast<std::uint64_t>(index) * 8U : 0U;
+                        const Uv base_uv = base ? Uv{read_f32(bytes, base), read_f32(bytes, base + 4)} : Uv{};
+                        const Uv lightmap_uv = lightmap ?
+                            Uv{read_f32(bytes, lightmap), read_f32(bytes, lightmap + 4)} : Uv{};
+                        gpu_vertices_.push_back({vertex.x, vertex.y, vertex.z,
+                            base_uv.u, base_uv.v, lightmap_uv.u, lightmap_uv.v,
+                            lightmap_uv.u, lightmap_uv.v, nx, ny, nz, index});
+                    }
+                    faces_.push_back({});
+                    draw_batches_.back().count += 3;
+                }
+                ++scene_world_sector_count_;
+                candidate = data + struct_size - 1U;
+            }
+        }
+    }
+
+    if (gpu_vertices_.empty()) {
+        error_ = "No renderable standard Clump/Atomic instances were found";
+        return false;
+    }
+    center_ = {(minimum.x + maximum.x) * 0.5F, (minimum.y + maximum.y) * 0.5F,
+               (minimum.z + maximum.z) * 0.5F};
+    radius_ = 0.0F;
+    for (const auto& vertex : vertices_) {
+        const auto x = vertex.x - center_.x, y = vertex.y - center_.y, z = vertex.z - center_.z;
+        radius_ = std::max(radius_, std::sqrt(x * x + y * y + z * z));
+    }
+    radius_ = std::max(radius_, 0.001F);
     if (!create_gpu_resources()) return false;
     reset_view();
     return true;
@@ -522,30 +1061,43 @@ bool GeometryPreview::create_gpu_resources() {
     constexpr const char* vertex_source = R"GLSL(#version 330 core
 layout(location=0) in vec3 aPosition;
 layout(location=1) in vec2 aBaseUv;
-layout(location=2) in vec2 aDebugUv;
-layout(location=3) in vec3 aNormal;
+layout(location=2) in vec2 aLightmapUv;
+layout(location=3) in vec2 aDebugUv;
+layout(location=4) in vec3 aNormal;
 uniform vec3 uCenter;
 uniform float uYaw, uPitch, uDistance;
 uniform vec2 uPan;
 uniform float uAspect, uTanHalfFov, uNear, uFar;
+uniform bool uYUp;
 out vec2 vUv;
+out vec2 vLightmapUv;
 out vec2 vDebugUv;
 out vec3 vNormal;
 void main() {
     vec3 p = aPosition - uCenter;
     float cy=cos(uYaw), sy=sin(uYaw), cp=cos(uPitch), sp=sin(uPitch);
-    float rx=cy*p.x-sy*p.y, ry=sy*p.x+cy*p.y;
-    vec3 view=vec3(rx+uPan.x, cp*p.z-sp*ry+uPan.y, sp*p.z+cp*ry-uDistance);
-    float nrx=cy*aNormal.x-sy*aNormal.y, nry=sy*aNormal.x+cy*aNormal.y;
-    vNormal=vec3(nrx, cp*aNormal.z-sp*nry, sp*aNormal.z+cp*nry);
+    vec3 view;
+    if (uYUp) {
+        float rx=cy*p.x-sy*p.z, rz=sy*p.x+cy*p.z;
+        view=vec3(rx+uPan.x, cp*p.y-sp*rz+uPan.y, sp*p.y+cp*rz-uDistance);
+        float nrx=cy*aNormal.x-sy*aNormal.z, nrz=sy*aNormal.x+cy*aNormal.z;
+        vNormal=vec3(nrx, cp*aNormal.y-sp*nrz, sp*aNormal.y+cp*nrz);
+    } else {
+        float rx=cy*p.x-sy*p.y, ry=sy*p.x+cy*p.y;
+        view=vec3(rx+uPan.x, cp*p.z-sp*ry+uPan.y, sp*p.z+cp*ry-uDistance);
+        float nrx=cy*aNormal.x-sy*aNormal.y, nry=sy*aNormal.x+cy*aNormal.y;
+        vNormal=vec3(nrx, cp*aNormal.z-sp*nry, sp*aNormal.z+cp*nry);
+    }
     float f=1.0/uTanHalfFov;
     gl_Position=vec4(view.x*f/uAspect, view.y*f,
         ((uFar+uNear)/(uNear-uFar))*view.z+(2.0*uFar*uNear)/(uNear-uFar), -view.z);
     vUv=aBaseUv;
+    vLightmapUv=aLightmapUv;
     vDebugUv=aDebugUv;
 })GLSL";
     constexpr const char* fragment_source = R"GLSL(#version 330 core
 in vec2 vUv;
+in vec2 vLightmapUv;
 in vec2 vDebugUv;
 in vec3 vNormal;
 uniform sampler2D uTexture;
@@ -555,6 +1107,7 @@ uniform bool uUseLightmap;
 uniform bool uLightmapOnly;
 uniform bool uUseDebugUv;
 uniform bool uApplyLighting;
+uniform float uLightmapIntensity;
 uniform vec4 uBaseColor;
 out vec4 FragColor;
 void main() {
@@ -562,8 +1115,9 @@ void main() {
     vec2 uv=uUseDebugUv ? vDebugUv : vUv;
     vec4 color=uUseTexture ? texture(uTexture,uv) : uBaseColor;
     if (uUseLightmap) {
-        vec4 lightmap=texture(uLightmapTexture,vDebugUv);
-        color=uLightmapOnly ? vec4(lightmap.rgb,1.0) : vec4(color.rgb*lightmap.rgb,color.a);
+        vec4 lightmap=texture(uLightmapTexture,vLightmapUv);
+        vec3 lit=lightmap.rgb*uLightmapIntensity;
+        color=uLightmapOnly ? vec4(lit,1.0) : vec4(color.rgb*lit,color.a);
     }
     if (color.a < 0.08) discard;
     FragColor=vec4(color.rgb*(uApplyLighting ? light : 1.0),color.a);
@@ -615,9 +1169,12 @@ void main() {
                              reinterpret_cast<void*>(offsetof(GpuVertex, base_u)));
     gl.enable_vertex_attrib_array(2);
     gl.vertex_attrib_pointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(GpuVertex),
-                             reinterpret_cast<void*>(offsetof(GpuVertex, debug_u)));
+                             reinterpret_cast<void*>(offsetof(GpuVertex, lightmap_u)));
     gl.enable_vertex_attrib_array(3);
-    gl.vertex_attrib_pointer(3, 3, GL_FLOAT, GL_FALSE, sizeof(GpuVertex),
+    gl.vertex_attrib_pointer(3, 2, GL_FLOAT, GL_FALSE, sizeof(GpuVertex),
+                             reinterpret_cast<void*>(offsetof(GpuVertex, debug_u)));
+    gl.enable_vertex_attrib_array(4);
+    gl.vertex_attrib_pointer(4, 3, GL_FLOAT, GL_FALSE, sizeof(GpuVertex),
                              reinterpret_cast<void*>(offsetof(GpuVertex, nx)));
     gl.bind_vertex_array(0);
     return true;
@@ -660,9 +1217,15 @@ void GeometryPreview::render_gpu() {
     const float focal = std::min(canvas_width_, canvas_height_) * 0.78F;
     const float pan_world_x = pan_x_ * distance_ / std::max(focal, 1.0F);
     const float pan_world_z = -pan_y_ * distance_ / std::max(focal, 1.0F);
-    const float near_plane = std::max(radius_ * 0.01F, 0.00001F);
-    const float far_plane = std::max(distance_ + radius_ * 3.0F, near_plane + 1.0F);
-    gl.uniform_3f(gl.get_uniform_location(shader_program_, "uCenter"), center_.x, center_.y, center_.z);
+    const float near_plane = std::max(distance_ * 0.001F,
+        std::max(radius_ * 0.000001F, 0.001F));
+    const float navigation_distance = std::sqrt(navigation_offset_.x * navigation_offset_.x +
+        navigation_offset_.y * navigation_offset_.y + navigation_offset_.z * navigation_offset_.z);
+    const float far_plane = std::max(distance_ + radius_ * 3.0F + navigation_distance,
+                                     near_plane + 1.0F);
+    gl.uniform_3f(gl.get_uniform_location(shader_program_, "uCenter"),
+                  center_.x + navigation_offset_.x, center_.y + navigation_offset_.y,
+                  center_.z + navigation_offset_.z);
     gl.uniform_1f(gl.get_uniform_location(shader_program_, "uYaw"), yaw_);
     gl.uniform_1f(gl.get_uniform_location(shader_program_, "uPitch"), pitch_);
     gl.uniform_1f(gl.get_uniform_location(shader_program_, "uDistance"), distance_);
@@ -673,6 +1236,7 @@ void GeometryPreview::render_gpu() {
                   std::tan(25.0F * 3.14159265358979323846F / 180.0F));
     gl.uniform_1f(gl.get_uniform_location(shader_program_, "uNear"), near_plane);
     gl.uniform_1f(gl.get_uniform_location(shader_program_, "uFar"), far_plane);
+    gl.uniform_1i(gl.get_uniform_location(shader_program_, "uYUp"), scene_mode_);
     gl.uniform_1i(gl.get_uniform_location(shader_program_, "uTexture"), 0);
     gl.uniform_1i(gl.get_uniform_location(shader_program_, "uLightmapTexture"), 1);
     const GLint use_texture_location = gl.get_uniform_location(shader_program_, "uUseTexture");
@@ -680,6 +1244,7 @@ void GeometryPreview::render_gpu() {
     const GLint lightmap_only_location = gl.get_uniform_location(shader_program_, "uLightmapOnly");
     const GLint use_debug_uv_location = gl.get_uniform_location(shader_program_, "uUseDebugUv");
     const GLint base_color_location = gl.get_uniform_location(shader_program_, "uBaseColor");
+    gl.uniform_1f(gl.get_uniform_location(shader_program_, "uLightmapIntensity"), lightmap_intensity_);
     gl.uniform_1i(use_debug_uv_location, view_style_ == 3 || view_style_ == 4);
     gl.uniform_1i(gl.get_uniform_location(shader_program_, "uApplyLighting"), view_style_ < 3);
 
@@ -704,12 +1269,12 @@ void GeometryPreview::render_gpu() {
         for (const auto& batch : draw_batches_) {
             const auto material = static_cast<std::size_t>(batch.material);
             GLuint texture{}, lightmap{};
-            if ((view_style_ == 0 || view_style_ == 6) && !uv_sets_.empty() &&
+            if ((view_style_ == 0 || view_style_ == 6) && (scene_mode_ || !uv_sets_.empty()) &&
                 material < material_textures_.size())
                 texture = material_textures_[material];
             else if ((view_style_ == 3 || view_style_ == 4) && selected_uv_set_ < uv_sets_.size())
                 texture = checker_texture_;
-            if ((view_style_ == 5 || view_style_ == 6) && selected_uv_set_ < uv_sets_.size() &&
+            if ((view_style_ == 5 || view_style_ == 6) && (scene_mode_ || uv_sets_.size() > 1) &&
                 material < material_lightmap_textures_.size())
                 lightmap = material_lightmap_textures_[material];
             set_color(batch.material);
@@ -765,7 +1330,7 @@ void GeometryPreview::draw(const rws::Chunk& geometry_chunk,
             missing_texture_count_, !uv_sets_.empty() ? "present" : "missing");
         if (!texture_status_.empty()) { ImGui::SameLine(); ImGui::TextDisabled("%s", texture_status_.c_str()); }
     }
-    if (view_style_ >= 3 && view_style_ <= 6) {
+    if (view_style_ == 3 || view_style_ == 4) {
         if (uv_sets_.empty()) {
             ImGui::TextColored(ImVec4(1, 0.55F, 0.25F, 1), "This geometry has no UV sets.");
         } else {
@@ -782,19 +1347,26 @@ void GeometryPreview::draw(const rws::Chunk& geometry_chunk,
             }
             ImGui::SameLine();
             ImGui::TextDisabled("%zu channel%s available", uv_sets_.size(), uv_sets_.size() == 1 ? "" : "s");
-            if (view_style_ >= 4 && uv_sets_.size() < 2)
+            if (view_style_ == 4 && uv_sets_.size() < 2)
                 ImGui::TextColored(ImVec4(1, 0.55F, 0.25F, 1),
                                    "UV2 is absent; showing the selected channel instead.");
         }
     }
     if (view_style_ == 5 || view_style_ == 6) {
+        ImGui::SetNextItemWidth(160.0F);
+        ImGui::SliderFloat("Lightmap intensity", &lightmap_intensity_, 0.25F, 4.0F, "%.2fx");
         const auto resolved = std::count_if(material_lightmap_textures_.begin(),
             material_lightmap_textures_.end(), [](const unsigned int texture) { return texture != 0; });
         ImGui::Text("Embedded MatFX lightmaps: %zu/%zu material slots resolved",
                     static_cast<std::size_t>(resolved), material_lightmap_textures_.size());
         if (!texture_status_.empty()) { ImGui::SameLine(); ImGui::TextDisabled("%s", texture_status_.c_str()); }
+        if (uv_sets_.size() < 2)
+            ImGui::TextColored(ImVec4(1, 0.55F, 0.25F, 1),
+                               "UV2 is absent; MatFX lightmapping is disabled.");
+        else
+            ImGui::TextDisabled("MatFX lightmap coordinates: UV set 2");
     }
-    ImGui::TextDisabled("Left drag: orbit | Middle/right drag: pan | Wheel: zoom | Double-click: frame");
+    ImGui::TextDisabled("WASD/QE: move | Left: look | Right: orbit | Middle: pan | Wheel: zoom | Shift: faster");
 
     const auto available = ImGui::GetContentRegionAvail();
     const ImVec2 size{std::max(available.x, 64.0F), std::max(available.y, 160.0F)};
@@ -808,17 +1380,27 @@ void GeometryPreview::draw(const rws::Chunk& geometry_chunk,
         const auto& io = ImGui::GetIO();
         if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) reset_view();
         if (ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
-            yaw_ += io.MouseDelta.x * 0.01F;
-            pitch_ = std::clamp(pitch_ + io.MouseDelta.y * 0.01F, -1.5F, 1.5F);
+            target_yaw_ -= io.MouseDelta.x * 0.01F;
+            target_pitch_ = std::clamp(target_pitch_ + io.MouseDelta.y * 0.01F, -1.5F, 1.5F);
+            preserve_camera_position_ = true;
         }
-        if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle) || ImGui::IsMouseDragging(ImGuiMouseButton_Right)) {
+        if (ImGui::IsMouseDragging(ImGuiMouseButton_Right)) {
+            target_yaw_ += io.MouseDelta.x * 0.01F;
+            target_pitch_ = std::clamp(target_pitch_ + io.MouseDelta.y * 0.01F, -1.5F, 1.5F);
+            preserve_camera_position_ = false;
+        }
+        if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
             pan_x_ += io.MouseDelta.x;
             pan_y_ += io.MouseDelta.y;
         }
-        if (io.MouseWheel != 0.0F)
-            distance_ = std::clamp(distance_ * std::exp(-io.MouseWheel * 0.16F), radius_ * 1.05F,
+        if (io.MouseWheel != 0.0F) {
+            const float minimum_distance = scene_mode_ ? std::max(radius_ * 0.0001F, 0.05F) :
+                                                         std::max(radius_ * 0.02F, 0.001F);
+            distance_ = std::clamp(distance_ * std::exp(-io.MouseWheel * 0.16F), minimum_distance,
                                    radius_ * 100.0F);
+        }
     }
+    update_keyboard_navigation();
     if (!error_.empty()) {
         draw_list->AddText({origin.x + 12, origin.y + 12}, IM_COL32(255, 120, 90, 255), error_.c_str());
         return;
@@ -830,6 +1412,95 @@ void GeometryPreview::draw(const rws::Chunk& geometry_chunk,
     draw_list->AddCallback(ImDrawCallback_ResetRenderState, nullptr);
     const std::string statistics = std::to_string(vertices_.size()) + " vertices | " +
         std::to_string(faces_.size()) + " triangles | GPU depth test";
+    draw_list->AddText({origin.x + 10, origin.y + 9}, IM_COL32(225, 229, 238, 255), statistics.c_str());
+}
+
+void GeometryPreview::draw_scene(const std::vector<rws::Chunk>& chunks,
+                                 const std::span<const std::byte> bytes,
+                                 const std::filesystem::path& source_path) {
+    if (!scene_mode_) load_scene(chunks, bytes, source_path);
+
+    ImGui::Text("Scene: %zu clumps | %zu atomic instances | %zu terrain sectors | %zu skipped",
+                scene_clump_count_, scene_instance_count_, scene_world_sector_count_, scene_skipped_count_);
+    ImGui::TextDisabled("Frame hierarchies and the recovered RenderWare World are included; 23 custom tree instances remain opaque.");
+    constexpr std::array scene_styles{0, 1, 2, 5, 6, 7};
+    constexpr const char* scene_style_names[] = {
+        "Textured", "Material index", "Material color", "Lightmap texture",
+        "Base + lightmap", "Wireframe"};
+    auto selected_style = std::find(scene_styles.begin(), scene_styles.end(), view_style_);
+    int scene_style = selected_style == scene_styles.end() ? 1 :
+        static_cast<int>(std::distance(scene_styles.begin(), selected_style));
+    ImGui::SetNextItemWidth(165.0F);
+    if (ImGui::Combo("View style", &scene_style, scene_style_names,
+                     static_cast<int>(std::size(scene_style_names))))
+        view_style_ = scene_styles[static_cast<std::size_t>(scene_style)];
+    ImGui::SameLine();
+    if (view_style_ != 7) { ImGui::Checkbox("Wire overlay", &wireframe_); ImGui::SameLine(); }
+    ImGui::Checkbox("Cull backfaces", &cull_backfaces_); ImGui::SameLine();
+    if (ImGui::Button("Frame whole scene")) reset_view(); ImGui::SameLine();
+    if (ImGui::Button("Reload edited bytes")) load_scene(chunks, bytes, source_path);
+    ImGui::SetNextItemWidth(150.0F);
+    ImGui::SliderFloat("Move speed", &navigation_speed_, 0.05F, 4.0F, "%.2fx",
+                       ImGuiSliderFlags_Logarithmic);
+    ImGui::SameLine();
+    ImGui::TextDisabled("camera distance %.1f", distance_);
+    if (view_style_ == 0)
+        ImGui::Text("DDS files: %zu loaded | material slots unresolved: %zu",
+                    loaded_texture_count_, missing_texture_count_);
+    if (view_style_ == 5 || view_style_ == 6) {
+        ImGui::SetNextItemWidth(180.0F);
+        ImGui::SliderFloat("Lightmap intensity", &lightmap_intensity_, 0.25F, 4.0F);
+        const auto resolved = std::count_if(material_lightmap_textures_.begin(),
+            material_lightmap_textures_.end(), [](const unsigned int texture) { return texture != 0; });
+        ImGui::Text("Standard-clump MatFX lightmaps: %zu/%zu material slots",
+                    static_cast<std::size_t>(resolved), material_lightmap_textures_.size());
+    }
+    if (!texture_status_.empty()) ImGui::TextDisabled("%s", texture_status_.c_str());
+    ImGui::TextDisabled("WASD/QE: move | Left: look | Right: orbit | Middle: pan | Wheel: zoom | Shift: faster");
+
+    const auto available = ImGui::GetContentRegionAvail();
+    const ImVec2 size{std::max(available.x, 64.0F), std::max(available.y, 160.0F)};
+    const auto origin = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton("scene_canvas", size,
+        ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonMiddle | ImGuiButtonFlags_MouseButtonRight);
+    auto* draw_list = ImGui::GetWindowDrawList();
+    draw_list->AddRectFilled(origin, {origin.x + size.x, origin.y + size.y}, IM_COL32(22, 25, 31, 255));
+    draw_list->AddRect(origin, {origin.x + size.x, origin.y + size.y}, IM_COL32(70, 76, 88, 255));
+    if (ImGui::IsItemHovered()) {
+        const auto& io = ImGui::GetIO();
+        if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) reset_view();
+        if (ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+            target_yaw_ -= io.MouseDelta.x * 0.01F;
+            target_pitch_ = std::clamp(target_pitch_ + io.MouseDelta.y * 0.01F, -1.5F, 1.5F);
+            preserve_camera_position_ = true;
+        }
+        if (ImGui::IsMouseDragging(ImGuiMouseButton_Right)) {
+            target_yaw_ += io.MouseDelta.x * 0.01F;
+            target_pitch_ = std::clamp(target_pitch_ + io.MouseDelta.y * 0.01F, -1.5F, 1.5F);
+            preserve_camera_position_ = false;
+        }
+        if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
+            pan_x_ += io.MouseDelta.x;
+            pan_y_ += io.MouseDelta.y;
+        }
+        if (io.MouseWheel != 0.0F) {
+            const float minimum_distance = scene_mode_ ? std::max(radius_ * 0.0001F, 0.05F) :
+                                                         std::max(radius_ * 0.02F, 0.001F);
+            distance_ = std::clamp(distance_ * std::exp(-io.MouseWheel * 0.16F), minimum_distance,
+                                   radius_ * 100.0F);
+        }
+    }
+    update_keyboard_navigation();
+    if (!error_.empty()) {
+        draw_list->AddText({origin.x + 12, origin.y + 12}, IM_COL32(255, 120, 90, 255), error_.c_str());
+        return;
+    }
+    canvas_x_ = origin.x; canvas_y_ = origin.y;
+    canvas_width_ = size.x; canvas_height_ = size.y;
+    draw_list->AddCallback(render_callback, this);
+    draw_list->AddCallback(ImDrawCallback_ResetRenderState, nullptr);
+    const std::string statistics = std::to_string(vertices_.size()) + " transformed vertices | " +
+        std::to_string(faces_.size()) + " triangles | standard RWS scene";
     draw_list->AddText({origin.x + 10, origin.y + 9}, IM_COL32(225, 229, 238, 255), statistics.c_str());
 }
 

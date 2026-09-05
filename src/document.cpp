@@ -92,6 +92,36 @@ void Document::parse() {
         stream_library_id_ = read_u32(bytes_, 8);
     }
     parse_range(0, bytes_.size(), chunks_, 0, true);
+
+    // CSF map streams may place a short game-specific instance table between
+    // the ordinary top-level Clumps and an embedded RenderWare World. Recover
+    // only a strongly identifiable World suffix: matching library stamp,
+    // leading Struct child, and a declared end at (or just beyond) physical EOF.
+    // The small overrun is retained as truncation instead of rewriting the file.
+    if (stream_library_id_ && bytes_.size() >= header_size * 2) {
+        std::uint64_t scan_begin{};
+        if (!chunks_.empty())
+            scan_begin = chunks_.back().payload_offset + chunks_.back().available_size;
+        for (std::uint64_t candidate = scan_begin;
+             candidate + header_size * 2 <= bytes_.size(); ++candidate) {
+            if (read_u32(bytes_, candidate) != 0x0B ||
+                read_u32(bytes_, candidate + 8) != *stream_library_id_ ||
+                read_u32(bytes_, candidate + header_size) != 0x01 ||
+                read_u32(bytes_, candidate + header_size + 8) != *stream_library_id_)
+                continue;
+            const auto declared = static_cast<std::uint64_t>(read_u32(bytes_, candidate + 4));
+            const auto physical = bytes_.size() - candidate - header_size;
+            if (declared < physical || declared - physical > 4096) continue;
+            std::vector<Chunk> recovered;
+            parse_range(candidate, bytes_.size(), recovered, 0, false);
+            if (recovered.size() == 1 && recovered.front().type == 0x0B) {
+                chunks_.push_back(std::move(recovered.front()));
+                diagnostics_.push_back({Diagnostic::Severity::warning, candidate,
+                    "Recovered RenderWare World after CSF-specific instance records"});
+            }
+            break;
+        }
+    }
 }
 
 void Document::parse_range(const std::uint64_t begin, const std::uint64_t end,

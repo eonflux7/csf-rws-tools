@@ -59,6 +59,19 @@ int main() {
         assert(!document.diagnostics().empty());
     }
     {
+        std::vector<std::byte> bytes;
+        append_header(bytes, 0x01, 0); // ordinary stream prefix establishes the stamp
+        for (int i = 0; i < 5; ++i) bytes.push_back(std::byte{0x55}); // game-specific records
+        const auto world_offset = bytes.size();
+        append_header(bytes, 0x0B, 44); // one Struct child, declared 32 bytes beyond EOF
+        append_header(bytes, 0x01, 0);
+        const auto document = rws::Document::from_bytes(std::move(bytes));
+        assert(document.chunks().size() == 2);
+        assert(document.chunks()[1].offset == world_offset);
+        assert(document.chunks()[1].type == 0x0B && document.chunks()[1].truncated);
+        assert(document.chunks()[1].children.size() == 1);
+    }
+    {
         constexpr std::uint32_t struct_size = 120;
         std::vector<std::byte> bytes;
         append_header(bytes, 0x0F, 12 + struct_size);

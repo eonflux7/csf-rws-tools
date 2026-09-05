@@ -58,13 +58,26 @@ cmake --build build-core --config Release
 
 An asset can also be dropped onto the GUI. The first Geometry is selected
 automatically; selecting a Geometry or one of its child chunks opens the `3D Preview`
-tab. Left-drag orbits, middle/right-drag pans, the wheel zooms, and double-clicking
-frames the mesh. The view selector switches between Textured, Material index,
+tab. Left-drag free-looks from the current camera position, right-drag orbits the
+focus point, middle-drag pans, the wheel zooms, and double-clicking frames the mesh.
+Camera rotation and movement are smoothed to tolerate uneven whole-scene frame
+times. With the viewport hovered, WASD moves horizontally, Q/E moves
+vertically, and Shift accelerates movement. The assembled scene camera follows
+CSF's Y-up world coordinates, while raw individual geometry uses its local Z-up
+coordinates. Movement automatically slows as the camera zooms in, and the whole
+scene view provides a logarithmic speed multiplier for fine adjustments. Textures
+use generated mip chains, trilinear filtering, and up to 8x
+anisotropic filtering. The view selector switches between Textured, Material index,
 Material color, UV checker, Lightmap UV, Lightmap texture, Base + lightmap, and
-Wireframe modes. The UV and lightmap modes can inspect any stored UV channel and
-select UV2 by default when present. Base textures and MatFX-embedded dual textures
-are resolved against a sibling `Textures` directory and loaded from DXT1/DXT3 DDS
-files.
+Wireframe modes. The UV inspection modes can inspect any stored UV channel and
+select UV2 by default for the lightmap view. MatFX-embedded dual textures are bound
+to UV2, while base textures use UV1. Both are resolved against a sibling `Textures`
+directory and loaded from DXT1/DXT3 DDS files.
+The `Whole RWS Scene` preview draws every standard Clump/Atomic instance with its
+composed Frame List transform. It supports diffuse textures, MatFX lightmaps,
+combined lighting, material diagnostics, and wireframe. The game-specific scene
+prefix remains opaque, but the standard RenderWare World following it is recovered
+and rendered as terrain.
 Selecting a Geometry also enables local-space OBJ export. `Save copy` writes
 `<original>.edited.rws`; it never overwrites the source file.
 

@@ -500,6 +500,10 @@ int main(int argc, char** argv) {
                         geometry_preview.draw(*geometry, document->bytes(), document->source_path());
                         ImGui::EndTabItem();
                     }
+                    if (ImGui::BeginTabItem("Whole RWS Scene")) {
+                        geometry_preview.draw_scene(document->chunks(), document->bytes(), document->source_path());
+                        ImGui::EndTabItem();
+                    }
                     if (ImGui::BeginTabItem("Inspector / Hex")) {
                         draw_typed_details(*chunk, *document, status, owner ? owner->type : 0);
                         draw_hex(*document, payload_offset, available_size);
