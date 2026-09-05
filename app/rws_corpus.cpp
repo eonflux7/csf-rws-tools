@@ -1,0 +1,112 @@
+#include "rws/document.hpp"
+#include "rws/decoded.hpp"
+
+#include <algorithm>
+#include <cctype>
+#include <cstdint>
+#include <filesystem>
+#include <iomanip>
+#include <iostream>
+#include <map>
+#include <string>
+#include <system_error>
+#include <vector>
+
+namespace {
+
+struct Stats { std::uint64_t count{}, bytes{}, truncated{}; };
+
+void collect(const std::vector<rws::Chunk>& chunks, std::map<std::uint32_t, Stats>& stats) {
+    for (const auto& chunk : chunks) {
+        auto& value = stats[chunk.type];
+        ++value.count;
+        value.bytes += chunk.available_size;
+        value.truncated += chunk.truncated ? 1U : 0U;
+        collect(chunk.children, stats);
+    }
+}
+
+bool is_rws(const std::filesystem::path& path) {
+    auto extension = path.extension().string();
+    std::transform(extension.begin(), extension.end(), extension.begin(),
+        [](const unsigned char value) { return static_cast<char>(std::tolower(value)); });
+    return extension == ".rws";
+}
+
+struct RootKey {
+    std::uint32_t type{}, stamp{};
+    auto operator<=>(const RootKey&) const = default;
+};
+
+} // namespace
+
+int main(const int argc, char** argv) {
+    if (argc != 2) {
+        std::cerr << "Usage: rws-corpus <directory>\n";
+        return 2;
+    }
+    const std::filesystem::path root(argv[1]);
+    std::error_code error;
+    if (!std::filesystem::is_directory(root, error)) {
+        std::cerr << "rws-corpus: directory not found: " << root.string() << '\n';
+        return 1;
+    }
+
+    std::vector<std::filesystem::path> files;
+    for (std::filesystem::recursive_directory_iterator it(root, error), end; it != end; it.increment(error)) {
+        if (error) { std::cerr << "warning: " << error.message() << '\n'; error.clear(); continue; }
+        if (it->is_regular_file(error) && is_rws(it->path())) files.push_back(it->path());
+    }
+    std::sort(files.begin(), files.end());
+
+    std::map<RootKey, Stats> roots;
+    std::map<std::uint32_t, Stats> chunks;
+    std::uint64_t total_bytes{}, warning_files{}, failed_files{};
+    std::cout << "file\tbytes\troot\tversion/build\tdiagnostics\n";
+    for (const auto& path : files) {
+        try {
+            const auto document = rws::Document::load(path);
+            total_bytes += document.bytes().size();
+            warning_files += document.diagnostics().empty() ? 0U : 1U;
+            collect(document.chunks(), chunks);
+            std::cout << std::filesystem::relative(path, root, error).string() << '\t'
+                      << document.bytes().size() << '\t';
+            if (!document.chunks().empty()) {
+                const auto& first = document.chunks().front();
+                auto& value = roots[{first.type, first.library_id}];
+                ++value.count; value.bytes += document.bytes().size(); value.truncated += first.truncated ? 1U : 0U;
+                const auto version = rws::decode_library_id(first.library_id);
+                std::cout << "0x" << std::hex << first.type << std::dec << " " << rws::chunk_name(first.type)
+                          << '\t' << version.major << '.' << version.minor << '.' << version.revision << '.'
+                          << version.binary << '/' << version.build;
+            } else {
+                std::cout << "none\tunknown";
+            }
+            std::cout << '\t' << document.diagnostics().size() << '\n';
+        } catch (const std::exception& exception) {
+            ++failed_files;
+            std::cerr << path.string() << ": " << exception.what() << '\n';
+        }
+    }
+
+    std::cout << "\nCorpus: " << files.size() << " files, " << total_bytes << " bytes, "
+              << warning_files << " files with diagnostics, " << failed_files << " failed loads\n";
+    std::cout << "\nRoot formats:\n";
+    for (const auto& [key, value] : roots) {
+        const auto version = rws::decode_library_id(key.stamp);
+        std::cout << "  0x" << std::hex << std::setw(8) << std::setfill('0') << key.type << std::dec
+                  << std::setfill(' ') << "  " << std::left << std::setw(28) << rws::chunk_name(key.type)
+                  << std::right << " files=" << value.count << " bytes=" << value.bytes
+                  << " RW=" << version.major << '.' << version.minor << '.' << version.revision << '.'
+                  << version.binary << " build=" << version.build << '\n';
+    }
+    std::cout << "\nChunk inventory:\n";
+    for (const auto& [type, value] : chunks) {
+        std::cout << "  0x" << std::hex << std::setw(8) << std::setfill('0') << type << std::dec
+                  << std::setfill(' ') << "  " << std::left << std::setw(32) << rws::chunk_name(type)
+                  << std::right << " count=" << value.count << " payload=" << value.bytes
+                  << " truncated=" << value.truncated << '\n';
+    }
+    return failed_files == 0 ? 0 : 1;
+}
+

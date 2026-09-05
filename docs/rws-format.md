@@ -1,0 +1,237 @@
+# Commandos: Strike Force RWS notes
+
+Status: working reverse-engineering notes, 2026-09-05. `Confirmed` below means
+observed in both supplied ST05 samples or directly described by the RenderWare SDK
+stream model. `Hypothesis` means the interpretation still needs cross-file or runtime
+validation.
+
+## Sources and terminology
+
+The strongest available baseline is the preserved RenderWare Graphics 3.7.0.2 SDK
+and its documentation:
+
+- Local RenderWare Studio 2.0.1 source and bundled Graphics SDK:
+  `C:\Users\eon\Downloads\rwstudio-v2.0.1-main`
+- <https://github.com/sigmaco/rwsdk-v3.7.0.2>
+- <https://rwsreader.sourceforge.net/>
+- <https://gtamods.com/wiki/RenderWare_binary_stream_file>
+- <https://gtamods.com/wiki/List_of_RW_section_IDs>
+
+The last two are community references and are used as indices, not as evidence for
+CSF-specific fields. All CSF-specific claims below come from the supplied files.
+
+## Generic RenderWare chunk header — confirmed
+
+All integers in the supplied PC files are little-endian. Every standard chunk begins
+with this 12-byte header:
+
+| Offset | Type | Meaning |
+|---:|---|---|
+| `0x00` | `u32` | chunk type / section ID |
+| `0x04` | `u32` | payload byte count, excluding this header |
+| `0x08` | `u32` | packed library version and build stamp |
+
+The next sibling begins at `header_offset + 12 + payload_size`. A container payload
+is itself a sequence of chunk headers. A `Struct` (`0x01`) is parent-dependent raw
+binary data and must not be recursively scanned.
+
+Both ST05 files use library ID `0x1C020037`. RenderWare's packed-stamp algorithm
+decodes it as version `0x37002` (3.7.0.2), build 55 (`0x0037`). This matches the SDK
+version expected for the title.
+
+## Core IDs observed
+
+| ID | Name | Role seen in ST05 |
+|---:|---|---|
+| `0x01` | Struct | parent-specific fixed/array data |
+| `0x02` | String | texture name/mask string chunks |
+| `0x03` | Extension | container for plugin chunks |
+| `0x06` | Texture | sampler plus two strings and extensions |
+| `0x07` | Material | color/surface data, optional texture, extensions |
+| `0x08` | Material List | material index table and materials |
+| `0x09` | Atomic Section | leaf geometry sector in a World BSP |
+| `0x0A` | Plane Section | branch node in a World BSP |
+| `0x0B` | World | collision/world tree root in `ST05_COL.rws` |
+| `0x0E` | Frame List | frame transforms and per-frame extensions |
+| `0x0F` | Geometry | vertices, triangles, material list, extensions |
+| `0x10` | Clump | model root in `st05.rws` |
+| `0x12` | Light | one light in the main sample |
+| `0x14` | Atomic | binds a frame to a geometry |
+| `0x1A` | Geometry List | geometry count and geometry chunks |
+| `0x1F` | Right To Render | standard plugin seen on atomics/geometries |
+
+Observed model hierarchy:
+
+```text
+Clump
+├─ Struct
+├─ Frame List
+│  ├─ Struct
+│  └─ Extension(s)
+├─ Geometry List
+│  ├─ Struct
+│  └─ Geometry(s)
+│     ├─ Struct
+│     ├─ Material List
+│     └─ Extension
+├─ Atomic(s)
+├─ optional Light(s)
+└─ Extension
+```
+
+Observed collision hierarchy:
+
+```text
+World
+├─ Struct
+├─ Material List
+├─ Plane Section (recursive BSP branches)
+│  └─ ... Plane Section / Atomic Section
+└─ Extension
+```
+
+## Plugin and game-extension inventory
+
+The full archive establishes that most initially unknown IDs are standard Criterion
+plugins. Chunk IDs encode a 24-bit vendor in the upper bits and an 8-bit object ID.
+The RenderWare 3.7 header assigns vendors `0x01` to Toolkit, `0x05` to World,
+`0x07` to RenderWare Studio, `0x08` to Audio, and `0x09` to RenderWare Physics.
+
+| ID | Name | Full-corpus count | Payload bytes |
+|---:|---|---:|---:|
+| `0x00000116` | Skin Plugin | 2 | 6,802 |
+| `0x0000011E` | HAnim Plugin | 139 | 3,376 |
+| `0x0000011F` | User Data Plugin | 374 | 32,449 |
+| `0x00000120` | Material Effects Plugin | 902 | 72,536 |
+| `0x00000127` | Anisotropy Plugin | 645 | 2,580 |
+| `0x0000050E` | Bin Mesh Plugin | 370 | 1,988,576 |
+| `0xFFFFFF00` | Pyro Studios object metadata | 1,765 | 67,237 |
+
+`0xFFFFFF00` is registered by the game on several RenderWare object classes and its
+schema depends on the object owning the `Extension`. It is therefore decoded with
+owner context, not as one global structure. The supplied corpus contains 369 Atomic,
+772 Material, 622 Frame, one World Sector, and one Light instance. Atomic records are
+versioned through version 11 and can carry two length-prefixed strings and optional
+six-float bounds; Material and Frame records have optional metadata/name records.
+Names include Spanish surface terms such as `Baldosa` and `Cemento`. Numeric field
+semantics remain conservative until their runtime consumers are traced.
+
+See [corpus findings](corpus-findings.md) for the separate RenderWare Physics
+streams discovered under `Models`.
+
+## RenderWare Physics typed records
+
+`CommXPC.exe` contains the RenderWare Physics 3.7 readers statically. Ghidra-backed
+control flow proves `0x907` is `RwpBodyDef`, `0x909` is `RwpRagdollDef`, and `0x90B`
+is `RwpGenericDef`. The implemented decoder understands the tagged scalar, vector,
+quaternion, matrix, transform, recursive volume, body, joint, and lookup-table
+records required by every supplied Physics stream. See
+[corpus findings](corpus-findings.md) for tags, reader addresses, and validation.
+
+Body-definition typed output exposes the semantics proven by executable data flow:
+mass, center of mass, principal inertia, principal-inertia orientation, scalar
+inertia, and body flags. Two floats and one vector remain explicitly marked unknown.
+This corrects the earlier provisional interpretation of the inertia vector and
+quaternion as a body/world transform.
+
+The low 16 bits of a Physics record tag select its type; the high 16 bits contain
+the record version. This is an internal Physics serialization grammar inside the
+ordinary outer RenderWare `Struct`, not another layer of 12-byte RW chunk headers.
+
+## Typed standard structures — confirmed against ST05
+
+The current decoder consumes the following Struct payloads exactly:
+
+- Clump: three `i32` object counts.
+- Frame List: `i32 count`, followed by `count` records of a 3x3 float rotation,
+  float position, signed parent index, and flags (56 bytes per frame).
+- Geometry: four 32-bit header fields followed conditionally by prelight colors,
+  up to eight UV arrays, 8-byte streamed triangles, and morph targets containing a
+  bounding sphere plus optional position and normal arrays.
+- Material List: count plus signed remap indices.
+- Material: flags, RGBA, textured flag, and three surface-property floats.
+- Atomic: frame index, geometry index, flags, and unused word.
+- World 3.7 header: root kind, inverse origin, aggregate counts, format, and bounds.
+- Plane Section: axis/split and left/right child descriptors.
+- Atomic Section: material base, counts, bounds, and collision-presence flag.
+- Texture: packed filtering/addressing modes plus name and mask String chunks.
+- HAnim: hierarchy metadata and node table.
+- Skin: byte-sized bone counts, used-bone table, four packed bone indices and four
+  float weights per Geometry vertex, 4x4 inverse matrices per bone, and the split
+  header (`boneLimit`, mesh count, RLE count). Skin decoding is contextual because
+  the vertex count belongs to the owning Geometry.
+- User Data: array count, then an unpadded length-prefixed name, format, element
+  count, and typed values for each array. Formats `1`, `2`, and `3` are respectively
+  signed 32-bit integer, 32-bit real, and length-prefixed string, matching
+  `RpUserDataFormat` in the Studio SDK's `rpusrdat.h`.
+- Bin Mesh: mesh/material groups and topology index arrays.
+- Anisotropy and Right To Render: scalar/pipeline metadata.
+- RenderWare Physics Body and Ragdoll definitions: recursive tagged records,
+  including all volume/body/joint structures present in the extracted corpus.
+
+All 4,782 applicable model structures and all 26 applicable collision structures
+decode without a boundary/count failure. Geometry array sizes consume their Struct
+chunks exactly.
+
+The Skin layout has two independent checks. Each of the two CSF chunks is 3,401
+bytes and belongs to a 153-vertex Geometry with five bones; the complete formula is
+`4 + 5 + 153*4 + 153*16 + 5*64 + 12 = 3401`. RenderWare Studio's bundled
+`2wpv_ragdoll_*_coords.dff` files provide a separate RW 3.4 sample: 5,740 vertices,
+26 bones, 24 used bones, and a 116,504-byte Skin payload satisfying the same layout.
+
+All 374 User Data payloads consume exactly with no alignment padding assumed. One
+representative 85-byte Geometry extension contains three single-value integer arrays:
+`hayTagID = 1`, `bNivelTest = 0`, and `FVF.UserData = 0x3003`.
+
+RenderWare's streamed triangle words are ordered as vertex 1, vertex 0, material,
+vertex 2 rather than the in-memory `RpTriangle` order. Both candidate arrangements
+were range-tested against vertex/material counts: all 369 ST05 geometries uniquely
+select the streamed arrangement, with zero memory-order or ambiguous cases.
+
+The OBJ exporter uses the first morph target that contains positions, the first UV
+set, optional normals, the validated streamed triangles, and `material_N` groups.
+Geometry is currently exported in its local frame; applying Frame List transforms
+and extracting texture images remain future work.
+
+## Sample inventory and anomalies
+
+### `st05.rws`
+
+- Physical size: 28,979,398 bytes.
+- 244 standard top-level Clump chunks occupy `[0, 0x00DD9095)`.
+- Those clumps contain 369 geometries/atomics and 645 Texture chunks.
+- At `0x00DD9095`, a repeating CSF-specific region begins. Its first 12 bytes happen
+  to look like type `0x00016FC0`, size 99, and the normal library stamp, but the next
+  record does not start at the implied chunk boundary.
+- The region is 14,458,929 bytes and contains embedded ordinary chunk headers,
+  transforms, numeric IDs, and length-prefixed names such as `ARBOL_3`.
+
+Interpretation: the tail is not a plain sibling chunk stream. It is likely an
+instance/scene table whose records embed RenderWare subobjects. Treating every
+12-byte-looking sequence as a chunk creates false positives, so the current parser
+stops the top-level tree after the first incompatible boundary and preserves the
+entire tail as opaque bytes.
+
+### `ST05_COL.rws`
+
+- Physical size: 6,187,753 bytes.
+- Starts with one World chunk and a 15-entry Material List.
+- The World declares 6,189,685 payload bytes, or 6,189,697 bytes including its
+  header. The physical file is therefore 1,944 bytes shorter than declared.
+- The rightmost Plane Section inherits the same EOF truncation.
+
+This may be a damaged/cut sample or a tolerated exporter defect. Do not rewrite the
+declared sizes until another copy or another stage confirms the intended behavior.
+
+## Parsing rules used by rws-man
+
+1. Read only complete 12-byte headers.
+2. Perform all end calculations in 64 bits.
+3. Clamp declared payloads to their containing range and flag truncation.
+4. Recursively parse only known container types; keep Struct and unknown chunks raw.
+5. Require nested candidates to use the stream's library stamp. This avoids
+   manufacturing chunks from float/index data.
+6. Preserve original bytes exactly unless a user explicitly edits them.
+
+These rules are intentionally conservative. Typed editing will be enabled one schema
+at a time after round-trip tests exist for that schema.

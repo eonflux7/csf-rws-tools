@@ -1,0 +1,72 @@
+cmake_minimum_required(VERSION 3.24)
+
+project(rws-man VERSION 0.1.0 LANGUAGES CXX)
+
+option(RWSMAN_BUILD_GUI "Build the Dear ImGui desktop application" ON)
+option(RWSMAN_BUILD_TESTS "Build parser tests" ON)
+
+add_library(rws_core
+    src/document.cpp
+    src/chunk_names.cpp
+    src/decoded.cpp
+    src/obj_export.cpp
+)
+add_library(rws::core ALIAS rws_core)
+target_include_directories(rws_core PUBLIC include)
+target_compile_features(rws_core PUBLIC cxx_std_20)
+if(MSVC)
+    target_compile_options(rws_core PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(rws_core PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+add_executable(rws-info app/rws_info.cpp)
+target_link_libraries(rws-info PRIVATE rws::core)
+
+add_executable(rws-corpus app/rws_corpus.cpp)
+target_link_libraries(rws-corpus PRIVATE rws::core)
+
+if(RWSMAN_BUILD_GUI)
+    include(FetchContent)
+    set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+    set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(glfw
+        GIT_REPOSITORY https://github.com/glfw/glfw.git
+        GIT_TAG 3.4
+        GIT_SHALLOW TRUE
+    )
+    FetchContent_Declare(imgui
+        GIT_REPOSITORY https://github.com/ocornut/imgui.git
+        GIT_TAG v1.91.9b
+        GIT_SHALLOW TRUE
+    )
+    FetchContent_MakeAvailable(glfw imgui)
+
+    find_package(OpenGL REQUIRED)
+    add_library(imgui_backend STATIC
+        ${imgui_SOURCE_DIR}/imgui.cpp
+        ${imgui_SOURCE_DIR}/imgui_draw.cpp
+        ${imgui_SOURCE_DIR}/imgui_tables.cpp
+        ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
+    )
+    target_include_directories(imgui_backend PUBLIC
+        ${imgui_SOURCE_DIR}
+        ${imgui_SOURCE_DIR}/backends
+    )
+    target_link_libraries(imgui_backend PUBLIC glfw OpenGL::GL)
+    target_compile_features(imgui_backend PUBLIC cxx_std_20)
+
+    add_executable(rws-man app/main.cpp app/geometry_preview.cpp)
+    target_link_libraries(rws-man PRIVATE rws::core imgui_backend)
+endif()
+
+if(RWSMAN_BUILD_TESTS)
+    enable_testing()
+    add_executable(rws_core_tests tests/document_tests.cpp)
+    target_link_libraries(rws_core_tests PRIVATE rws::core)
+    add_test(NAME rws_core_tests COMMAND rws_core_tests)
+endif()

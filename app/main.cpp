@@ -1,0 +1,516 @@
+#include "rws/document.hpp"
+#include "rws/decoded.hpp"
+#include "rws/obj_export.hpp"
+#include "geometry_preview.hpp"
+
+#include <GLFW/glfw3.h>
+#include <imgui.h>
+#include <imgui_impl_glfw.h>
+#include <imgui_impl_opengl3.h>
+
+#include <algorithm>
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <exception>
+#include <filesystem>
+#include <memory>
+#include <optional>
+#include <sstream>
+#include <string>
+
+namespace {
+
+std::optional<std::filesystem::path> dropped_file;
+
+void drop_callback(GLFWwindow*, const int count, const char** paths) {
+    if (count > 0) {
+        dropped_file = std::filesystem::path(paths[0]);
+    }
+}
+
+const rws::Chunk* find_chunk(const std::vector<rws::Chunk>& chunks, const std::uint64_t offset) {
+    for (const auto& chunk : chunks) {
+        if (chunk.offset == offset) return &chunk;
+        if (const auto* child = find_chunk(chunk.children, offset)) return child;
+    }
+    return nullptr;
+}
+
+const rws::Chunk* find_first_chunk(const std::vector<rws::Chunk>& chunks, const std::uint32_t type) {
+    for (const auto& chunk : chunks) {
+        if (chunk.type == type) return &chunk;
+        if (const auto* child = find_first_chunk(chunk.children, type)) return child;
+    }
+    return nullptr;
+}
+
+const rws::Chunk* find_owning_geometry(const std::vector<rws::Chunk>& chunks,
+                                       std::uint64_t offset,
+                                       const rws::Chunk* geometry);
+
+const rws::Chunk* find_preview_geometry(const rws::Chunk& selected,
+                                        const std::vector<rws::Chunk>& all_chunks) {
+    if (selected.type == 0x0F) return &selected;
+    if (selected.type == 0x10 || selected.type == 0x1A)
+        return find_first_chunk(selected.children, 0x0F);
+    return find_owning_geometry(all_chunks, selected.offset, nullptr);
+}
+
+const rws::Chunk* find_owning_object(const std::vector<rws::Chunk>& chunks, const std::uint64_t offset,
+                                     const rws::Chunk* owner = nullptr) {
+    for (const auto& chunk : chunks) {
+        if (chunk.offset == offset) return owner;
+        const auto* child_owner = chunk.type == 0x03 ? owner : &chunk;
+        if (const auto* found = find_owning_object(chunk.children, offset, child_owner)) return found;
+    }
+    return nullptr;
+}
+
+const rws::Chunk* find_owning_geometry(const std::vector<rws::Chunk>& chunks,
+                                       const std::uint64_t offset,
+                                       const rws::Chunk* geometry = nullptr) {
+    for (const auto& chunk : chunks) {
+        const auto* current = chunk.type == 0x0F ? &chunk : geometry;
+        if (chunk.offset == offset) return current;
+        if (const auto* found = find_owning_geometry(chunk.children, offset, current)) return found;
+    }
+    return nullptr;
+}
+
+void draw_tree(const std::vector<rws::Chunk>& chunks, std::optional<std::uint64_t>& selected) {
+    for (const auto& chunk : chunks) {
+        const bool has_children = !chunk.children.empty();
+        ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth;
+        if (!has_children) flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
+        if (selected && *selected == chunk.offset) flags |= ImGuiTreeNodeFlags_Selected;
+        if (chunk.truncated) ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 170, 64, 255));
+        const bool open = ImGui::TreeNodeEx(reinterpret_cast<void*>(static_cast<std::uintptr_t>(chunk.offset + 1)),
+            flags, "%s  @ 0x%llX  (%u)", rws::chunk_name(chunk.type).data(),
+            static_cast<unsigned long long>(chunk.offset), chunk.declared_size);
+        if (chunk.truncated) ImGui::PopStyleColor();
+        if (ImGui::IsItemClicked()) selected = chunk.offset;
+        if (has_children && open) {
+            draw_tree(chunk.children, selected);
+            ImGui::TreePop();
+        }
+    }
+}
+
+void draw_hex(rws::Document& document, const std::uint64_t begin, const std::uint64_t size) {
+    const auto bytes = document.bytes();
+    const auto end = std::min<std::uint64_t>(begin + size, bytes.size());
+    const auto shown_end = std::min<std::uint64_t>(end, begin + 4096);
+    ImGui::TextDisabled("Payload bytes (editable, first 4096 bytes)");
+    ImGui::BeginChild("hex", ImVec2(0, 0), ImGuiChildFlags_Borders, ImGuiWindowFlags_HorizontalScrollbar);
+    for (std::uint64_t row = begin; row < shown_end; row += 16) {
+        ImGui::Text("%08llX", static_cast<unsigned long long>(row));
+        ImGui::SameLine(85.0F);
+        for (std::uint64_t column = 0; column < 16 && row + column < shown_end; ++column) {
+            const auto offset = row + column;
+            auto value = static_cast<unsigned int>(std::to_integer<unsigned char>(bytes[static_cast<std::size_t>(offset)]));
+            ImGui::PushID(static_cast<int>(column));
+            ImGui::SetNextItemWidth(27.0F);
+            if (ImGui::InputScalar("##byte", ImGuiDataType_U32, &value, nullptr, nullptr, "%02X",
+                                   ImGuiInputTextFlags_CharsHexadecimal | ImGuiInputTextFlags_EnterReturnsTrue)) {
+                document.set_byte(offset, static_cast<std::byte>(value & 0xFFU));
+            }
+            ImGui::PopID();
+            if (column != 15) ImGui::SameLine();
+        }
+    }
+    ImGui::EndChild();
+}
+
+void draw_vec3(const char* label, const rws::Vec3& value) {
+    ImGui::Text("%s: %.4f, %.4f, %.4f", label, value.x, value.y, value.z);
+}
+
+void draw_typed_details(const rws::Chunk& chunk, rws::Document& document, std::string& status,
+                        const std::uint32_t parent_type = 0) {
+    const auto bytes = document.bytes();
+    const auto version = rws::decode_library_id(chunk.library_id);
+    ImGui::Text("RenderWare %u.%u.%u.%u, build %u", version.major, version.minor,
+                version.revision, version.binary, version.build);
+    ImGui::SeparatorText("Decoded structure");
+    switch (chunk.type) {
+    case 0x06: {
+        const auto decoded = rws::decode_texture(chunk, bytes);
+        if (!decoded) { ImGui::TextDisabled("%s", decoded.error.c_str()); break; }
+        ImGui::Text("Name: %s", decoded.value->name.c_str());
+        ImGui::Text("Mask: %s", decoded.value->mask_name.c_str());
+        ImGui::Text("Filter: %u | address U/V: %u/%u | packed: 0x%08X",
+            decoded.value->filter_mode, decoded.value->address_u, decoded.value->address_v,
+            decoded.value->filter_addressing);
+        break;
+    }
+    case 0x08: {
+        const auto decoded = rws::decode_material_list(chunk, bytes);
+        if (!decoded) { ImGui::TextDisabled("%s", decoded.error.c_str()); break; }
+        ImGui::Text("Materials: %d | remap entries: %zu", decoded.value->material_count,
+            decoded.value->remap.size());
+        break;
+    }
+    case 0x07: {
+        const auto decoded = rws::decode_material(chunk, bytes);
+        if (!decoded) { ImGui::TextDisabled("%s", decoded.error.c_str()); break; }
+        const auto& value = *decoded.value;
+        ImGui::Text("RGBA: %u, %u, %u, %u | textured: %s", value.color[0], value.color[1],
+            value.color[2], value.color[3], value.textured ? "yes" : "no");
+        ImGui::Text("Surface: ambient %.3f, specular %.3f, diffuse %.3f",
+            value.ambient, value.specular, value.diffuse);
+        break;
+    }
+    case 0x09: {
+        const auto decoded = rws::decode_world_sector(chunk, bytes);
+        if (!decoded) { ImGui::TextDisabled("%s", decoded.error.c_str()); break; }
+        const auto& value = *decoded.value;
+        ImGui::Text("Vertices: %d | triangles: %d | material base: %d", value.vertex_count,
+            value.triangle_count, value.material_window_base);
+        draw_vec3("Bounds min", value.bounding_box_inf);
+        draw_vec3("Bounds max", value.bounding_box_sup);
+        break;
+    }
+    case 0x0A: {
+        const auto decoded = rws::decode_plane_sector(chunk, bytes);
+        if (!decoded) { ImGui::TextDisabled("%s", decoded.error.c_str()); break; }
+        const auto& value = *decoded.value;
+        ImGui::Text("Axis: %d | split: %.4f | left %.4f (%s) | right %.4f (%s)", value.axis,
+            value.split, value.left_value, value.left_is_world_sector ? "leaf" : "branch",
+            value.right_value, value.right_is_world_sector ? "leaf" : "branch");
+        break;
+    }
+    case 0x0B: {
+        const auto decoded = rws::decode_world(chunk, bytes);
+        if (!decoded) { ImGui::TextDisabled("%s", decoded.error.c_str()); break; }
+        const auto& value = *decoded.value;
+        ImGui::Text("Vertices: %d | triangles: %d | planes: %d | leaves: %d", value.vertex_count,
+            value.triangle_count, value.plane_sector_count, value.world_sector_count);
+        ImGui::Text("Format: 0x%08X | root is %s", value.format,
+            value.root_is_world_sector ? "world sector" : "plane sector");
+        draw_vec3("Bounds max", value.bounding_box_sup);
+        draw_vec3("Bounds min", value.bounding_box_inf);
+        break;
+    }
+    case 0x0E: {
+        const auto decoded = rws::decode_frame_list(chunk, bytes);
+        if (!decoded) { ImGui::TextDisabled("%s", decoded.error.c_str()); break; }
+        ImGui::Text("Frames: %zu", decoded.value->frames.size());
+        if (ImGui::BeginTable("frames", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+            ImGui::TableSetupColumn("Index"); ImGui::TableSetupColumn("Parent"); ImGui::TableSetupColumn("Position");
+            ImGui::TableHeadersRow();
+            for (std::size_t i = 0; i < decoded.value->frames.size(); ++i) {
+                const auto& frame = decoded.value->frames[i];
+                ImGui::TableNextRow(); ImGui::TableNextColumn(); ImGui::Text("%zu", i);
+                ImGui::TableNextColumn(); ImGui::Text("%d", frame.parent);
+                ImGui::TableNextColumn(); ImGui::Text("%.3f, %.3f, %.3f", frame.position.x, frame.position.y, frame.position.z);
+            }
+            ImGui::EndTable();
+        }
+        break;
+    }
+    case 0x0F: {
+        const auto decoded = rws::decode_geometry(chunk, bytes);
+        if (!decoded) { ImGui::TextColored(ImVec4(1, 0.35F, 0.25F, 1), "%s", decoded.error.c_str()); break; }
+        const auto& value = *decoded.value;
+        ImGui::Text("Vertices: %d | triangles: %d | morph targets: %d | UV sets: %u",
+            value.vertex_count, value.triangle_count, value.morph_target_count, value.texcoord_sets);
+        ImGui::Text("Format: 0x%08X | Struct bytes: %llu (validated)", value.format,
+            static_cast<unsigned long long>(value.computed_size));
+        for (std::size_t i = 0; i < value.morph_targets.size(); ++i) {
+            const auto& morph = value.morph_targets[i];
+            ImGui::Text("Morph %zu: radius %.3f | vertices %s | normals %s", i, morph.sphere.radius,
+                morph.has_vertices ? "yes" : "no", morph.has_normals ? "yes" : "no");
+        }
+        const char* layout = value.triangle_layout == rws::TriangleLayout::stream_order ? "RenderWare stream" :
+            value.triangle_layout == rws::TriangleLayout::memory_order ? "memory order" : "ambiguous";
+        ImGui::Text("Triangle layout: %s | materials: %d", layout, value.material_count);
+        if (value.triangle_layout != rws::TriangleLayout::unknown && ImGui::Button("Export this geometry to OBJ")) {
+            try {
+                auto output = document.source_path();
+                std::ostringstream suffix;
+                suffix << ".geometry_" << std::hex << chunk.offset << ".obj";
+                output.replace_filename(output.stem().string() + suffix.str());
+                rws::export_geometry_obj(value, bytes, output);
+                status = "Exported " + output.string();
+            } catch (const std::exception& error) { status = error.what(); }
+        }
+        break;
+    }
+    case 0x10: {
+        const auto decoded = rws::decode_clump(chunk, bytes);
+        if (!decoded) { ImGui::TextDisabled("%s", decoded.error.c_str()); break; }
+        ImGui::Text("Atomics: %d | lights: %d | cameras: %d", decoded.value->atomics,
+            decoded.value->lights, decoded.value->cameras);
+        break;
+    }
+    case 0x14: {
+        const auto decoded = rws::decode_atomic(chunk, bytes);
+        if (!decoded) { ImGui::TextDisabled("%s", decoded.error.c_str()); break; }
+        ImGui::Text("Frame index: %d | geometry index: %d | flags: 0x%08X",
+            decoded.value->frame_index, decoded.value->geometry_index, decoded.value->flags);
+        break;
+    }
+    case 0x1F: {
+        const auto decoded = rws::decode_right_to_render(chunk, bytes);
+        if (!decoded) { ImGui::TextDisabled("%s", decoded.error.c_str()); break; }
+        ImGui::Text("Pipeline plugin: 0x%08X (%s) | extra data: 0x%08X",
+            decoded.value->plugin_id,
+            rws::chunk_name(decoded.value->plugin_id).data(), decoded.value->extra_data);
+        break;
+    }
+    case 0x11E: {
+        const auto decoded = rws::decode_hanim(chunk, bytes);
+        if (!decoded) { ImGui::TextDisabled("%s", decoded.error.c_str()); break; }
+        ImGui::Text("HAnim version: 0x%08X | hierarchy ID: %d | nodes: %zu",
+            decoded.value->version, decoded.value->hierarchy_id, decoded.value->nodes.size());
+        ImGui::Text("Flags: 0x%08X | keyframe size: %u", decoded.value->flags, decoded.value->keyframe_size);
+        break;
+    }
+    case 0x116: {
+        const auto* geometry_chunk = find_owning_geometry(document.chunks(), chunk.offset);
+        if (!geometry_chunk) { ImGui::TextDisabled("Skin is not inside a Geometry chunk"); break; }
+        const auto geometry = rws::decode_geometry(*geometry_chunk, bytes);
+        if (!geometry) { ImGui::TextDisabled("Owning Geometry: %s", geometry.error.c_str()); break; }
+        const auto decoded = rws::decode_skin(chunk, geometry.value->vertex_count, bytes);
+        if (!decoded) { ImGui::TextDisabled("%s", decoded.error.c_str()); break; }
+        const auto& value = *decoded.value;
+        ImGui::Text("Bones: %u (%u used) | vertices: %d | max weights: %u", value.bone_count,
+            value.used_bone_count, value.vertex_count, value.max_weights_per_vertex);
+        ImGui::Text("Split: bone limit %u | meshes %u | RLE entries %u | trailing bytes %llu",
+            value.bone_limit, value.mesh_count, value.rle_count,
+            static_cast<unsigned long long>(value.trailing_split_bytes));
+        break;
+    }
+    case 0x11F: {
+        const auto decoded = rws::decode_user_data(chunk, bytes);
+        if (!decoded) { ImGui::TextDisabled("%s", decoded.error.c_str()); break; }
+        ImGui::Text("Arrays: %zu", decoded.value->arrays.size());
+        for (const auto& array : decoded.value->arrays) {
+            const char* format = array.format == rws::UserDataFormat::integer ? "int" :
+                array.format == rws::UserDataFormat::real ? "real" : "string";
+            const auto count = array.format == rws::UserDataFormat::integer ? array.integers.size() :
+                array.format == rws::UserDataFormat::real ? array.reals.size() : array.strings.size();
+            ImGui::BulletText("%s: %s[%zu]", array.name.c_str(), format, count);
+            if (count == 1) {
+                ImGui::SameLine();
+                if (array.format == rws::UserDataFormat::integer) ImGui::Text("= %d (0x%X)", array.integers[0],
+                    static_cast<std::uint32_t>(array.integers[0]));
+                else if (array.format == rws::UserDataFormat::real) ImGui::Text("= %.6g", array.reals[0]);
+                else ImGui::Text("= %s", array.strings[0].c_str());
+            }
+        }
+        break;
+    }
+    case 0x127: {
+        const auto decoded = rws::decode_anisotropy(chunk, bytes);
+        if (!decoded) { ImGui::TextDisabled("%s", decoded.error.c_str()); break; }
+        ImGui::Text("Anisotropy coefficient: %.4f", decoded.value->coefficient);
+        break;
+    }
+    case 0x50E: {
+        const auto decoded = rws::decode_bin_mesh(chunk, bytes);
+        if (!decoded) { ImGui::TextDisabled("%s", decoded.error.c_str()); break; }
+        ImGui::Text("Meshes: %zu | indices: %u | flags: 0x%08X",
+            decoded.value->meshes.size(), decoded.value->total_indices, decoded.value->flags);
+        break;
+    }
+    case 0x907: {
+        const auto decoded = rws::decode_physics_body_def(chunk, bytes);
+        if (!decoded) { ImGui::TextDisabled("%s", decoded.error.c_str()); break; }
+        const auto& value = *decoded.value;
+        ImGui::Text("RwpBodyDef | root volume kind: 0x%X | version: %u", value.volume.kind,
+            value.volume.version);
+        ImGui::Text("Child volumes: %zu | group: %u | flags: 0x%X", value.volume.children.size(),
+            value.volume.group, value.volume.flags);
+        ImGui::Text("Mass: %.6g | scalar inertia: %.6g | body flags: 0x%08X",
+            value.mass, value.scalar_inertia, value.flags);
+        draw_vec3("Center of mass", value.center_of_mass);
+        draw_vec3("Principal inertia", value.principal_inertia);
+        ImGui::Text("Inertia orientation: %.5g, %.5g, %.5g, %.5g",
+            value.inertia_orientation[0], value.inertia_orientation[1],
+            value.inertia_orientation[2], value.inertia_orientation[3]);
+        ImGui::TextDisabled("Unresolved body fields: scalars %.6g / %.6g; vector %.6g, %.6g, %.6g",
+            value.unknown_scalars[0], value.unknown_scalars[1], value.unknown_vector.x,
+            value.unknown_vector.y, value.unknown_vector.z);
+        break;
+    }
+    case 0x909: {
+        const auto decoded = rws::decode_physics_ragdoll_def(chunk, bytes);
+        if (!decoded) { ImGui::TextDisabled("%s", decoded.error.c_str()); break; }
+        const auto& value = *decoded.value;
+        ImGui::Text("RwpRagdollDef | types: %u/%u", value.type_0, value.type_1);
+        ImGui::Text("Bodies: %u | joints: %u | lookup table: %u x %u (%zu values)",
+            value.body_count, value.joint_count, value.table_rows, value.table_columns,
+            value.table_values.size());
+        ImGui::Text("Body IDs: %zu | integer field: %u", value.body_ids.size(), value.integer_field);
+        break;
+    }
+    case 0xFFFFFF00U: {
+        const auto decoded = rws::decode_pyro_extension(chunk, parent_type, bytes);
+        if (!decoded) { ImGui::TextDisabled("%s", decoded.error.c_str()); break; }
+        const auto& value = *decoded.value;
+        ImGui::Text("Pyro plugin | owner: %s (0x%X) | version: %u",
+            rws::chunk_name(value.owner_type).data(), value.owner_type, value.version);
+        ImGui::Text("Fields: %zu | strings: %zu | optional record/bounds: %s",
+            value.words.size(), value.strings.size(), value.present ? "present" : "absent");
+        if (const auto flags = value.material_flags())
+            ImGui::Text("Material flags/mask: 0x%08X", *flags);
+        if (const auto surface = value.material_surface_type())
+            ImGui::Text("Material surface type: %u", *surface);
+        if (!value.object_name().empty())
+            ImGui::Text("Object/surface name: %s", value.object_name().data());
+        if (!value.words.empty() && ImGui::TreeNode("Raw numeric fields")) {
+            for (std::size_t i = 0; i < value.words.size(); ++i)
+                ImGui::Text("[%zu] %u (0x%08X)", i, value.words[i], value.words[i]);
+            ImGui::TreePop();
+        }
+        for (std::size_t i = 0; i < value.strings.size(); ++i)
+            ImGui::TextDisabled("String %zu: %s", i, value.strings[i].c_str());
+        if (value.bounds) {
+            ImGui::Text("Raw bounds pairs: %.4g/%.4g, %.4g/%.4g, %.4g/%.4g",
+                (*value.bounds)[0], (*value.bounds)[1], (*value.bounds)[2],
+                (*value.bounds)[3], (*value.bounds)[4], (*value.bounds)[5]);
+        }
+        break;
+    }
+    default:
+        ImGui::TextDisabled("No typed decoder for this chunk yet.");
+        break;
+    }
+    ImGui::SeparatorText("Raw payload");
+}
+
+} // namespace
+
+int main(int argc, char** argv) {
+    if (!glfwInit()) return 1;
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+    glfwWindowHint(GLFW_DEPTH_BITS, 24);
+    auto* window = glfwCreateWindow(1400, 850, "rws-man", nullptr, nullptr);
+    if (!window) {
+        glfwTerminate();
+        return 1;
+    }
+    glfwMakeContextCurrent(window);
+    glfwSwapInterval(1);
+    glfwSetDropCallback(window, drop_callback);
+
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGui::StyleColorsDark();
+    ImGui_ImplGlfw_InitForOpenGL(window, true);
+    ImGui_ImplOpenGL3_Init("#version 330");
+
+    std::unique_ptr<rws::Document> document;
+    rwsman::GeometryPreview geometry_preview;
+    std::optional<std::uint64_t> selected;
+    std::string status = "Drop an .rws file on this window or pass one on the command line.";
+    auto load = [&](const std::filesystem::path& path) {
+        try {
+            document = std::make_unique<rws::Document>(rws::Document::load(path));
+            geometry_preview.clear();
+            if (const auto* geometry = find_first_chunk(document->chunks(), 0x0F)) selected = geometry->offset;
+            else if (!document->chunks().empty()) selected = document->chunks().front().offset;
+            else selected.reset();
+            status = "Loaded " + path.string();
+        } catch (const std::exception& error) {
+            status = error.what();
+        }
+    };
+    if (argc > 1) load(argv[1]);
+
+    while (!glfwWindowShouldClose(window)) {
+        glfwPollEvents();
+        if (dropped_file) {
+            load(*dropped_file);
+            dropped_file.reset();
+        }
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+
+        ImGui::SetNextWindowPos(ImVec2(0, 0));
+        int width = 0, height = 0;
+        glfwGetFramebufferSize(window, &width, &height);
+        ImGui::SetNextWindowSize(ImVec2(static_cast<float>(width), static_cast<float>(height)));
+        ImGui::Begin("rws-man", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+            ImGuiWindowFlags_NoResize | ImGuiWindowFlags_MenuBar);
+        if (ImGui::BeginMenuBar()) {
+            if (document && ImGui::MenuItem("Save copy", nullptr, false, true)) {
+                try {
+                    auto output = document->source_path();
+                    output.replace_filename(output.stem().string() + ".edited" + output.extension().string());
+                    document->save_as(output);
+                    status = "Saved " + output.string();
+                } catch (const std::exception& error) { status = error.what(); }
+            }
+            ImGui::EndMenuBar();
+        }
+        ImGui::TextUnformatted(status.c_str());
+        ImGui::Separator();
+        if (document) {
+            ImGui::BeginChild("tree", ImVec2(490, 0), ImGuiChildFlags_Borders);
+            ImGui::Text("%zu bytes | %zu top-level chunks | %zu diagnostics%s",
+                document->bytes().size(), document->chunks().size(), document->diagnostics().size(),
+                document->dirty() ? " | modified" : "");
+            draw_tree(document->chunks(), selected);
+            ImGui::EndChild();
+            ImGui::SameLine();
+            ImGui::BeginChild("details", ImVec2(0, 0), ImGuiChildFlags_Borders);
+            const auto* chunk = selected ? find_chunk(document->chunks(), *selected) : nullptr;
+            if (chunk) {
+                ImGui::Text("%s (0x%08X)", rws::chunk_name(chunk->type).data(), chunk->type);
+                ImGui::Text("Header: 0x%llX   Payload: 0x%llX", static_cast<unsigned long long>(chunk->offset),
+                    static_cast<unsigned long long>(chunk->payload_offset));
+                ImGui::Text("Declared: %u   Available: %llu   Library ID: 0x%08X", chunk->declared_size,
+                    static_cast<unsigned long long>(chunk->available_size), chunk->library_id);
+                ImGui::Text("Vendor: %s (0x%06X)   Object ID: 0x%02X",
+                    rws::chunk_vendor_name(rws::chunk_vendor_id(chunk->type)).data(),
+                    rws::chunk_vendor_id(chunk->type), rws::chunk_object_id(chunk->type));
+                const auto payload_offset = chunk->payload_offset;
+                const auto available_size = chunk->available_size;
+                const auto* owner = find_owning_object(document->chunks(), chunk->offset);
+                const auto* geometry = find_preview_geometry(*chunk, document->chunks());
+                if (geometry && ImGui::BeginTabBar("chunk_views")) {
+                    if (ImGui::BeginTabItem("3D Preview")) {
+                        if (chunk->type == 0x10 || chunk->type == 0x1A)
+                            ImGui::TextDisabled("Previewing the first Geometry contained by this %s.",
+                                rws::chunk_name(chunk->type).data());
+                        geometry_preview.draw(*geometry, document->bytes(), document->source_path());
+                        ImGui::EndTabItem();
+                    }
+                    if (ImGui::BeginTabItem("Inspector / Hex")) {
+                        draw_typed_details(*chunk, *document, status, owner ? owner->type : 0);
+                        draw_hex(*document, payload_offset, available_size);
+                        ImGui::EndTabItem();
+                    }
+                    ImGui::EndTabBar();
+                } else {
+                    draw_typed_details(*chunk, *document, status, owner ? owner->type : 0);
+                    draw_hex(*document, payload_offset, available_size);
+                }
+            } else {
+                ImGui::TextDisabled("Select a chunk to inspect its payload.");
+            }
+            ImGui::EndChild();
+        }
+        ImGui::End();
+
+        ImGui::Render();
+        glViewport(0, 0, width, height);
+        glClearColor(0.08F, 0.09F, 0.11F, 1.0F);
+        glClear(GL_COLOR_BUFFER_BIT);
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        glfwSwapBuffers(window);
+    }
+    geometry_preview.clear();
+    ImGui_ImplOpenGL3_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+    ImGui::DestroyContext();
+    glfwDestroyWindow(window);
+    glfwTerminate();
+    return 0;
+}
