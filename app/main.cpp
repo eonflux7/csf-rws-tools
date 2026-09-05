@@ -303,6 +303,24 @@ void draw_typed_details(const rws::Chunk& chunk, rws::Document& document, std::s
         }
         break;
     }
+    case 0x120: {
+        const auto decoded = rws::decode_material_effects(chunk, parent_type, bytes);
+        if (!decoded) { ImGui::TextDisabled("%s", decoded.error.c_str()); break; }
+        const auto& value = *decoded.value;
+        if (parent_type == 0x14 || parent_type == 0x09) {
+            ImGui::Text("MatFX rendering pipeline: %s", value.pipeline_enabled ? "enabled" : "disabled");
+        } else {
+            ImGui::Text("Effect: %u | slot: %u | dual texture: %s", value.effect_type,
+                value.slot_type, value.has_dual_texture ? "present" : "absent");
+            ImGui::Text("Blend source/destination: %u/%u", value.source_blend, value.destination_blend);
+            if (value.has_dual_texture) {
+                ImGui::Text("Dual texture: %s", value.dual_texture.name.c_str());
+                ImGui::Text("Filter: %u | address U/V: %u/%u", value.dual_texture.filter_mode,
+                    value.dual_texture.address_u, value.dual_texture.address_v);
+            }
+        }
+        break;
+    }
     case 0x127: {
         const auto decoded = rws::decode_anisotropy(chunk, bytes);
         if (!decoded) { ImGui::TextDisabled("%s", decoded.error.c_str()); break; }

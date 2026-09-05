@@ -53,6 +53,7 @@ constexpr GLenum gl_link_status = 0x8B82;
 constexpr GLenum gl_array_buffer = 0x8892;
 constexpr GLenum gl_static_draw = 0x88E4;
 constexpr GLenum gl_texture0 = 0x84C0;
+constexpr GLenum gl_texture1 = gl_texture0 + 1;
 
 struct GlApi {
     CreateShaderProc create_shader{};
@@ -281,7 +282,9 @@ void GeometryPreview::clear() {
     draw_batches_.clear();
     material_colors_.clear();
     material_textures_.clear();
+    material_lightmap_textures_.clear();
     material_texture_names_.clear();
+    material_lightmap_texture_names_.clear();
     owned_texture_ids_.clear();
     checker_texture_ = 0;
     loaded_texture_count_ = missing_texture_count_ = 0;
@@ -346,7 +349,7 @@ bool GeometryPreview::load(const rws::Chunk& geometry_chunk,
             uv_sets_.push_back(std::move(uv_set));
         }
     }
-    if (view_style_ == 4 && uv_sets_.size() > 1) selected_uv_set_ = 1;
+    if (view_style_ >= 4 && view_style_ <= 6 && uv_sets_.size() > 1) selected_uv_set_ = 1;
 
     if (const auto* material_list_chunk = rws::find_child(geometry_chunk, 0x08)) {
         const auto material_list = rws::decode_material_list(*material_list_chunk, bytes);
@@ -356,37 +359,21 @@ bool GeometryPreview::load(const rws::Chunk& geometry_chunk,
                 if (child.type == 0x07) material_chunks.push_back(&child);
             material_colors_.resize(static_cast<std::size_t>(material_list.value->material_count), {190, 190, 190, 255});
             material_textures_.resize(material_colors_.size());
+            material_lightmap_textures_.resize(material_colors_.size());
             material_texture_names_.resize(material_colors_.size());
+            material_lightmap_texture_names_.resize(material_colors_.size());
             std::unordered_map<std::string, unsigned int> texture_cache;
-            std::size_t next_material{};
-            for (std::size_t i = 0; i < material_colors_.size(); ++i) {
-                const auto remap = i < material_list.value->remap.size() ? material_list.value->remap[i] : -1;
-                if (remap >= 0 && static_cast<std::size_t>(remap) < i) {
-                    material_colors_[i] = material_colors_[static_cast<std::size_t>(remap)];
-                    material_textures_[i] = material_textures_[static_cast<std::size_t>(remap)];
-                    material_texture_names_[i] = material_texture_names_[static_cast<std::size_t>(remap)];
-                    continue;
-                }
-                if (next_material >= material_chunks.size()) continue;
-                const auto& material_chunk = *material_chunks[next_material++];
-                const auto material = rws::decode_material(material_chunk, bytes);
-                if (material) material_colors_[i] = material.value->color;
-                const auto* texture_chunk = rws::find_child(material_chunk, 0x06);
-                if (!texture_chunk) continue;
-                const auto texture = rws::decode_texture(*texture_chunk, bytes);
-                if (!texture || texture.value->name.empty()) continue;
-                material_texture_names_[i] = texture.value->name;
-                if (const auto cached = texture_cache.find(texture.value->name); cached != texture_cache.end()) {
-                    material_textures_[i] = cached->second;
-                    continue;
-                }
-                const auto path = find_texture(source_path, texture.value->name);
+            auto load_texture = [&](const std::string& name) -> unsigned int {
+                if (name.empty()) return 0;
+                if (const auto cached = texture_cache.find(name); cached != texture_cache.end())
+                    return cached->second;
+                const auto path = find_texture(source_path, name);
                 if (path.empty()) {
                     ++missing_texture_count_;
                     if (texture_status_.empty())
-                        texture_status_ = "Could not locate " + texture.value->name + ".dds from " +
+                        texture_status_ = "Could not locate " + name + ".dds from " +
                             source_path.parent_path().string();
-                    continue;
+                    return 0;
                 }
                 int width{}, height{};
                 std::vector<std::uint8_t> rgba;
@@ -394,13 +381,45 @@ bool GeometryPreview::load(const rws::Chunk& geometry_chunk,
                 if (!decode_dds(path, width, height, rgba, texture_error)) {
                     ++missing_texture_count_;
                     if (texture_status_.empty()) texture_status_ = std::move(texture_error);
-                    continue;
+                    return 0;
                 }
                 const auto id = upload_texture(width, height, rgba.data());
                 owned_texture_ids_.push_back(id);
-                texture_cache.emplace(texture.value->name, id);
-                material_textures_[i] = id;
+                texture_cache.emplace(name, id);
                 ++loaded_texture_count_;
+                return id;
+            };
+            std::size_t next_material{};
+            for (std::size_t i = 0; i < material_colors_.size(); ++i) {
+                const auto remap = i < material_list.value->remap.size() ? material_list.value->remap[i] : -1;
+                if (remap >= 0 && static_cast<std::size_t>(remap) < i) {
+                    material_colors_[i] = material_colors_[static_cast<std::size_t>(remap)];
+                    material_textures_[i] = material_textures_[static_cast<std::size_t>(remap)];
+                    material_lightmap_textures_[i] = material_lightmap_textures_[static_cast<std::size_t>(remap)];
+                    material_texture_names_[i] = material_texture_names_[static_cast<std::size_t>(remap)];
+                    material_lightmap_texture_names_[i] =
+                        material_lightmap_texture_names_[static_cast<std::size_t>(remap)];
+                    continue;
+                }
+                if (next_material >= material_chunks.size()) continue;
+                const auto& material_chunk = *material_chunks[next_material++];
+                const auto material = rws::decode_material(material_chunk, bytes);
+                if (material) material_colors_[i] = material.value->color;
+                if (const auto* texture_chunk = rws::find_child(material_chunk, 0x06)) {
+                    const auto texture = rws::decode_texture(*texture_chunk, bytes);
+                    if (texture && !texture.value->name.empty()) {
+                        material_texture_names_[i] = texture.value->name;
+                        material_textures_[i] = load_texture(texture.value->name);
+                    }
+                }
+                const auto* extension = rws::find_child(material_chunk, 0x03);
+                const auto* effects_chunk = extension ? rws::find_child(*extension, 0x120) : nullptr;
+                if (!effects_chunk) continue;
+                const auto effects = rws::decode_material_effects(*effects_chunk, 0x07, bytes);
+                if (!effects || !effects.value->has_dual_texture || effects.value->dual_texture.name.empty())
+                    continue;
+                material_lightmap_texture_names_[i] = effects.value->dual_texture.name;
+                material_lightmap_textures_[i] = load_texture(effects.value->dual_texture.name);
             }
         }
     }
@@ -530,16 +549,24 @@ in vec2 vUv;
 in vec2 vDebugUv;
 in vec3 vNormal;
 uniform sampler2D uTexture;
+uniform sampler2D uLightmapTexture;
 uniform bool uUseTexture;
+uniform bool uUseLightmap;
+uniform bool uLightmapOnly;
 uniform bool uUseDebugUv;
+uniform bool uApplyLighting;
 uniform vec4 uBaseColor;
 out vec4 FragColor;
 void main() {
     float light=0.42+0.58*abs(dot(normalize(vNormal), normalize(vec3(0.35,0.55,0.75))));
     vec2 uv=uUseDebugUv ? vDebugUv : vUv;
     vec4 color=uUseTexture ? texture(uTexture,uv) : uBaseColor;
+    if (uUseLightmap) {
+        vec4 lightmap=texture(uLightmapTexture,vDebugUv);
+        color=uLightmapOnly ? vec4(lightmap.rgb,1.0) : vec4(color.rgb*lightmap.rgb,color.a);
+    }
     if (color.a < 0.08) discard;
-    FragColor=vec4(color.rgb*light,color.a);
+    FragColor=vec4(color.rgb*(uApplyLighting ? light : 1.0),color.a);
 })GLSL";
     auto compile = [&](const GLenum type, const char* source) -> GLuint {
         const GLuint shader = gl.create_shader(type);
@@ -647,10 +674,14 @@ void GeometryPreview::render_gpu() {
     gl.uniform_1f(gl.get_uniform_location(shader_program_, "uNear"), near_plane);
     gl.uniform_1f(gl.get_uniform_location(shader_program_, "uFar"), far_plane);
     gl.uniform_1i(gl.get_uniform_location(shader_program_, "uTexture"), 0);
+    gl.uniform_1i(gl.get_uniform_location(shader_program_, "uLightmapTexture"), 1);
     const GLint use_texture_location = gl.get_uniform_location(shader_program_, "uUseTexture");
+    const GLint use_lightmap_location = gl.get_uniform_location(shader_program_, "uUseLightmap");
+    const GLint lightmap_only_location = gl.get_uniform_location(shader_program_, "uLightmapOnly");
     const GLint use_debug_uv_location = gl.get_uniform_location(shader_program_, "uUseDebugUv");
     const GLint base_color_location = gl.get_uniform_location(shader_program_, "uBaseColor");
     gl.uniform_1i(use_debug_uv_location, view_style_ == 3 || view_style_ == 4);
+    gl.uniform_1i(gl.get_uniform_location(shader_program_, "uApplyLighting"), view_style_ < 3);
 
     auto set_color = [&](const std::uint16_t material) {
         if (view_style_ == 1) {
@@ -668,26 +699,36 @@ void GeometryPreview::render_gpu() {
                       rgba[2] / 255.0F, rgba[3] / 255.0F);
     };
 
-    if (view_style_ != 5) {
+    if (view_style_ != 7) {
         glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
         for (const auto& batch : draw_batches_) {
             const auto material = static_cast<std::size_t>(batch.material);
-            GLuint texture{};
-            if (view_style_ == 0 && !uv_sets_.empty() && material < material_textures_.size())
+            GLuint texture{}, lightmap{};
+            if ((view_style_ == 0 || view_style_ == 6) && !uv_sets_.empty() &&
+                material < material_textures_.size())
                 texture = material_textures_[material];
             else if ((view_style_ == 3 || view_style_ == 4) && selected_uv_set_ < uv_sets_.size())
                 texture = checker_texture_;
+            if ((view_style_ == 5 || view_style_ == 6) && selected_uv_set_ < uv_sets_.size() &&
+                material < material_lightmap_textures_.size())
+                lightmap = material_lightmap_textures_[material];
+            set_color(batch.material);
             gl.uniform_1i(use_texture_location, texture != 0);
-            if (texture) glBindTexture(GL_TEXTURE_2D, texture);
-            else set_color(batch.material);
+            gl.uniform_1i(use_lightmap_location, lightmap != 0);
+            gl.uniform_1i(lightmap_only_location, view_style_ == 5);
+            gl.active_texture(gl_texture0);
+            glBindTexture(GL_TEXTURE_2D, texture);
+            gl.active_texture(gl_texture1);
+            glBindTexture(GL_TEXTURE_2D, lightmap);
             glDrawArrays(GL_TRIANGLES, static_cast<GLint>(batch.first), static_cast<GLsizei>(batch.count));
         }
     }
-    if (view_style_ == 5 || wireframe_) {
+    if (view_style_ == 7 || wireframe_) {
         gl.uniform_1i(use_texture_location, 0);
-        const float color = view_style_ == 5 ? 0.84F : 0.09F;
-        gl.uniform_4f(base_color_location, color, view_style_ == 5 ? 0.88F : 0.10F,
-                      view_style_ == 5 ? 0.95F : 0.13F, 1.0F);
+        gl.uniform_1i(use_lightmap_location, 0);
+        const float color = view_style_ == 7 ? 0.84F : 0.09F;
+        gl.uniform_4f(base_color_location, color, view_style_ == 7 ? 0.88F : 0.10F,
+                      view_style_ == 7 ? 0.95F : 0.13F, 1.0F);
         glDepthFunc(GL_LEQUAL);
         glEnable(GL_POLYGON_OFFSET_LINE);
         glPolygonOffset(-1.0F, -1.0F);
@@ -697,6 +738,7 @@ void GeometryPreview::render_gpu() {
         glDisable(GL_POLYGON_OFFSET_LINE);
     }
     glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+    gl.active_texture(gl_texture0);
     gl.bind_vertex_array(0);
     gl.use_program(0);
 }
@@ -707,13 +749,14 @@ void GeometryPreview::draw(const rws::Chunk& geometry_chunk,
     if (chunk_offset_ != geometry_chunk.offset) load(geometry_chunk, bytes, source_path);
 
     constexpr const char* styles[] = {
-        "Textured", "Material index", "Material color", "UV checker", "Lightmap UV", "Wireframe"};
-    ImGui::SetNextItemWidth(150.0F);
+        "Textured", "Material index", "Material color", "UV checker", "Lightmap UV",
+        "Lightmap texture", "Base + lightmap", "Wireframe"};
+    ImGui::SetNextItemWidth(165.0F);
     if (ImGui::Combo("View style", &view_style_, styles, static_cast<int>(std::size(styles))) &&
-        view_style_ == 4 && uv_sets_.size() > 1)
+        view_style_ >= 4 && view_style_ <= 6 && uv_sets_.size() > 1)
         select_uv_set(1);
     ImGui::SameLine();
-    if (view_style_ != 5) { ImGui::Checkbox("Wire overlay", &wireframe_); ImGui::SameLine(); }
+    if (view_style_ != 7) { ImGui::Checkbox("Wire overlay", &wireframe_); ImGui::SameLine(); }
     ImGui::Checkbox("Cull backfaces", &cull_backfaces_); ImGui::SameLine();
     if (ImGui::Button("Frame geometry")) reset_view(); ImGui::SameLine();
     if (ImGui::Button("Reload edited bytes")) load(geometry_chunk, bytes, source_path);
@@ -722,7 +765,7 @@ void GeometryPreview::draw(const rws::Chunk& geometry_chunk,
             missing_texture_count_, !uv_sets_.empty() ? "present" : "missing");
         if (!texture_status_.empty()) { ImGui::SameLine(); ImGui::TextDisabled("%s", texture_status_.c_str()); }
     }
-    if (view_style_ == 3 || view_style_ == 4) {
+    if (view_style_ >= 3 && view_style_ <= 6) {
         if (uv_sets_.empty()) {
             ImGui::TextColored(ImVec4(1, 0.55F, 0.25F, 1), "This geometry has no UV sets.");
         } else {
@@ -739,10 +782,17 @@ void GeometryPreview::draw(const rws::Chunk& geometry_chunk,
             }
             ImGui::SameLine();
             ImGui::TextDisabled("%zu channel%s available", uv_sets_.size(), uv_sets_.size() == 1 ? "" : "s");
-            if (view_style_ == 4 && uv_sets_.size() < 2)
+            if (view_style_ >= 4 && uv_sets_.size() < 2)
                 ImGui::TextColored(ImVec4(1, 0.55F, 0.25F, 1),
                                    "UV2 is absent; showing the selected channel instead.");
         }
+    }
+    if (view_style_ == 5 || view_style_ == 6) {
+        const auto resolved = std::count_if(material_lightmap_textures_.begin(),
+            material_lightmap_textures_.end(), [](const unsigned int texture) { return texture != 0; });
+        ImGui::Text("Embedded MatFX lightmaps: %zu/%zu material slots resolved",
+                    static_cast<std::size_t>(resolved), material_lightmap_textures_.size());
+        if (!texture_status_.empty()) { ImGui::SameLine(); ImGui::TextDisabled("%s", texture_status_.c_str()); }
     }
     ImGui::TextDisabled("Left drag: orbit | Middle/right drag: pan | Wheel: zoom | Double-click: frame");
 

@@ -401,6 +401,69 @@ DecodeResult<TextureInfo> decode_texture(const Chunk& parent, const std::span<co
     return success(std::move(result));
 }
 
+DecodeResult<MaterialEffectsInfo> decode_material_effects(
+    const Chunk& chunk, const std::uint32_t owner_type, const std::span<const std::byte> bytes) {
+    Reader reader(bytes, chunk);
+    MaterialEffectsInfo result;
+    if (owner_type == 0x14 || owner_type == 0x09) {
+        std::uint32_t enabled{};
+        if (!reader.u32(enabled) || reader.remaining() != 0)
+            return failure<MaterialEffectsInfo>("Material Effects object pipeline payload is not exactly 4 bytes");
+        result.pipeline_enabled = enabled != 0;
+        return success(std::move(result));
+    }
+    if (owner_type != 0x07)
+        return failure<MaterialEffectsInfo>("Material Effects owner is not a Material, Atomic, or World Sector");
+
+    result.pipeline_enabled = true;
+    std::uint32_t texture_present{};
+    if (!reader.u32(result.effect_type) || !reader.u32(result.slot_type))
+        return failure<MaterialEffectsInfo>("Material Effects header is truncated");
+    if (result.effect_type != 4 || result.slot_type != 4)
+        return failure<MaterialEffectsInfo>("Only dual-pass Material Effects payloads are currently supported");
+    if (!reader.u32(result.source_blend) || !reader.u32(result.destination_blend) ||
+        !reader.u32(texture_present))
+        return failure<MaterialEffectsInfo>("Dual-pass Material Effects fields are truncated");
+    if (texture_present > 1)
+        return failure<MaterialEffectsInfo>("Dual-pass texture-present flag is invalid");
+    result.has_dual_texture = texture_present != 0;
+
+    if (result.has_dual_texture) {
+        std::uint32_t type{}, size{}, stamp{};
+        if (!reader.u32(type) || !reader.u32(size) || !reader.u32(stamp) || type != 0x06)
+            return failure<MaterialEffectsInfo>("Dual-pass effect is missing its embedded Texture chunk");
+        if (stamp != chunk.library_id || size > reader.remaining())
+            return failure<MaterialEffectsInfo>("Embedded dual Texture header is invalid or truncated");
+        const auto texture_end = reader.position() + size;
+
+        std::uint32_t child_type{}, child_size{}, child_stamp{};
+        if (!reader.u32(child_type) || !reader.u32(child_size) || !reader.u32(child_stamp) ||
+            child_type != 0x01 || child_size != 4 || child_stamp != chunk.library_id ||
+            !reader.u32(result.dual_texture.filter_addressing))
+            return failure<MaterialEffectsInfo>("Embedded dual Texture Struct is invalid");
+        result.dual_texture.filter_mode = static_cast<std::uint8_t>(result.dual_texture.filter_addressing & 0xFFU);
+        result.dual_texture.address_u = static_cast<std::uint8_t>((result.dual_texture.filter_addressing >> 8U) & 0x0FU);
+        result.dual_texture.address_v = static_cast<std::uint8_t>((result.dual_texture.filter_addressing >> 12U) & 0x0FU);
+
+        auto read_string_chunk = [&](std::string& value) {
+            return reader.u32(child_type) && reader.u32(child_size) && reader.u32(child_stamp) &&
+                child_type == 0x02 && child_stamp == chunk.library_id &&
+                reader.position() <= texture_end && child_size <= texture_end - reader.position() &&
+                reader.string(child_size, value);
+        };
+        if (!read_string_chunk(result.dual_texture.name) || !read_string_chunk(result.dual_texture.mask_name))
+            return failure<MaterialEffectsInfo>("Embedded dual Texture name or mask String is invalid");
+        if (!reader.u32(child_type) || !reader.u32(child_size) || !reader.u32(child_stamp) ||
+            child_type != 0x03 || child_stamp != chunk.library_id ||
+            reader.position() > texture_end || child_size != texture_end - reader.position() ||
+            !reader.skip(child_size))
+            return failure<MaterialEffectsInfo>("Embedded dual Texture Extension is invalid");
+    }
+    if (!reader.u32(result.trailing_slot_type) || result.trailing_slot_type != 0 || reader.remaining() != 0)
+        return failure<MaterialEffectsInfo>("Dual-pass Material Effects terminator is invalid");
+    return success(std::move(result));
+}
+
 DecodeResult<HAnimInfo> decode_hanim(const Chunk& chunk, const std::span<const std::byte> bytes) {
     Reader reader(bytes, chunk);
     HAnimInfo result;

@@ -77,6 +77,11 @@ void validate_types(const std::vector<rws::Chunk>& chunks, const std::span<const
             break;
         }
         case 0x11F: { auto value = rws::decode_user_data(chunk, bytes); error = value.error; break; }
+        case 0x120: {
+            auto value = rws::decode_material_effects(chunk, enclosing_object_type, bytes);
+            error = value.error;
+            break;
+        }
         case 0x127: { auto value = rws::decode_anisotropy(chunk, bytes); error = value.error; break; }
         case 0x50E: { auto value = rws::decode_bin_mesh(chunk, bytes); error = value.error; break; }
         case 0x907: { auto value = rws::decode_physics_body_def(chunk, bytes); error = value.error; break; }

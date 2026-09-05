@@ -65,6 +65,16 @@ struct TextureInfo {
     std::string mask_name;
 };
 
+struct MaterialEffectsInfo {
+    bool pipeline_enabled{};
+    std::uint32_t effect_type{};
+    std::uint32_t slot_type{};
+    bool has_dual_texture{};
+    std::uint32_t source_blend{}, destination_blend{};
+    TextureInfo dual_texture;
+    std::uint32_t trailing_slot_type{};
+};
+
 struct HAnimNodeInfo { std::int32_t node_id{}, node_index{}; std::uint32_t flags{}; };
 struct HAnimInfo {
     std::uint32_t version{};
@@ -226,6 +236,8 @@ struct DecodeResult {
 [[nodiscard]] DecodeResult<MaterialInfo> decode_material(const Chunk&, std::span<const std::byte>);
 [[nodiscard]] DecodeResult<MaterialListInfo> decode_material_list(const Chunk&, std::span<const std::byte>);
 [[nodiscard]] DecodeResult<TextureInfo> decode_texture(const Chunk&, std::span<const std::byte>);
+[[nodiscard]] DecodeResult<MaterialEffectsInfo> decode_material_effects(
+    const Chunk&, std::uint32_t owner_type, std::span<const std::byte>);
 [[nodiscard]] DecodeResult<HAnimInfo> decode_hanim(const Chunk&, std::span<const std::byte>);
 [[nodiscard]] DecodeResult<BinMeshInfo> decode_bin_mesh(const Chunk&, std::span<const std::byte>);
 [[nodiscard]] DecodeResult<RightToRenderInfo> decode_right_to_render(const Chunk&, std::span<const std::byte>);

@@ -54,7 +54,9 @@ private:
     std::vector<DrawBatch> draw_batches_;
     std::vector<std::array<std::uint8_t, 4>> material_colors_;
     std::vector<unsigned int> material_textures_;
+    std::vector<unsigned int> material_lightmap_textures_;
     std::vector<std::string> material_texture_names_;
+    std::vector<std::string> material_lightmap_texture_names_;
     std::vector<unsigned int> owned_texture_ids_;
     unsigned int checker_texture_{};
     unsigned int vertex_array_{}, vertex_buffer_{}, shader_program_{};

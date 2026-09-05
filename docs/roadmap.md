@@ -32,8 +32,8 @@ all extension payloads byte-for-byte.
   truncation, and source path.
 - [x] Decode standard Skin payloads using the owning Geometry vertex count.
 - [x] Decode standard User Data arrays (integer, real, and string formats).
-- Decode standard Material Effects
-  plugins before assigning any remaining bytes to game-specific extensions.
+- [x] Decode the standard dual-pass Material Effects payloads used by CSF,
+  including their embedded Texture stream, blend modes, and object pipeline flag.
 - [x] Decode HAnim, Anisotropy, Right To Render, and Bin Mesh plugin payloads.
 - [x] Cluster and decode `0xFFFFFF00` as owner-specific Pyro Atomic, Material,
   Frame, World Sector, and Light metadata.
@@ -59,6 +59,8 @@ views in the GUI.
   with Textured, Material Index, Material Color, UV Checker, and Wireframe styles.
 - [x] Add selectable geometry UV channels and a Lightmap UV checker that defaults
   to the conventional second UV set.
+- [x] Resolve CSF's `*_Lm` textures from MatFX dual-pass material payloads and add
+  lightmap-only and base-times-lightmap preview modes.
 - Assemble Clump previews from Atomic geometry/frame indices and hierarchical frame
   transforms.
 - Add selectable Physics primitive and ragdoll overlays.

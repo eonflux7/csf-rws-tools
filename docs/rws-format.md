@@ -166,6 +166,18 @@ The current decoder consumes the following Struct payloads exactly:
   `RpUserDataFormat` in the Studio SDK's `rpusrdat.h`.
 - Bin Mesh: mesh/material groups and topology index arrays.
 - Anisotropy and Right To Render: scalar/pipeline metadata.
+- Material Effects: CSF uses effect and slot type `4` (dual pass). Material
+  payloads store source/destination blend modes, a texture-present flag, a complete
+  embedded Texture chunk, and a zero second-slot terminator. ST05 uses source
+  `rwBLENDZERO` (`1`) and destination `rwBLENDSRCCOLOR` (`3`), producing base color
+  multiplied by the dual texture. Atomic payloads are a
+  four-byte pipeline-enabled flag. Across ST05 all 902 payloads decode exactly:
+  645 Material records and 257 Atomic records. All 645 embedded texture references
+  end in `_Lm` and select 33 unique external DXT1 files in the map's `Textures`
+  directory. The other 27 of the directory's 60 `*_Lm.dds` names occur in the
+  CSF-specific scene tail rather than the standard Clumps. Exactly 257 of the 369
+  Clump Geometries carry two UV sets, matching the 257 MatFX-enabled Atomics; the
+  other 112 Geometries have no UV arrays.
 - RenderWare Physics Body and Ragdoll definitions: recursive tagged records,
   including all volume/body/joint structures present in the extracted corpus.
 

@@ -116,6 +116,29 @@ int main() {
         assert(mesh.value->meshes[0].material_index == 2);
     }
     {
+        constexpr std::uint32_t texture_payload_size = 52;
+        constexpr std::uint32_t effects_payload_size = 88;
+        std::vector<std::byte> bytes;
+        append_header(bytes, 0x120, effects_payload_size);
+        append_u32(bytes, 4); // dual-pass effect
+        append_u32(bytes, 4); // dual-pass slot
+        append_u32(bytes, 1); // source: zero
+        append_u32(bytes, 3); // destination: source color
+        append_u32(bytes, 1); // embedded texture present
+        append_header(bytes, 0x06, texture_payload_size);
+        append_header(bytes, 0x01, 4); append_u32(bytes, 0x00011106);
+        append_header(bytes, 0x02, 8);
+        for (const char character : std::string("TEST_Lm\0", 8)) bytes.push_back(static_cast<std::byte>(character));
+        append_header(bytes, 0x02, 4); append_u32(bytes, 0);
+        append_header(bytes, 0x03, 0);
+        append_u32(bytes, 0); // unused second effect slot
+        const auto document = rws::Document::from_bytes(std::move(bytes));
+        const auto effects = rws::decode_material_effects(document.chunks()[0], 0x07, document.bytes());
+        assert(effects && effects.value->effect_type == 4 && effects.value->slot_type == 4);
+        assert(effects.value->has_dual_texture && effects.value->dual_texture.name == "TEST_Lm");
+        assert(effects.value->source_blend == 1 && effects.value->destination_blend == 3);
+    }
+    {
         std::vector<std::byte> bytes;
         append_header(bytes, 0x011E, 32);
         append_u32(bytes, 0x100); append_u32(bytes, 42); append_u32(bytes, 1);
