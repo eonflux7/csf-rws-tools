@@ -81,6 +81,26 @@ int main() {
         assert(geometry.value->morph_targets[0].has_normals);
     }
     {
+        constexpr std::uint32_t struct_size = 68;
+        std::vector<std::byte> bytes;
+        append_header(bytes, 0x0F, 12 + struct_size);
+        append_header(bytes, 0x01, struct_size);
+        append_u32(bytes, 0x00020002); // positions + two explicit UV sets
+        append_u32(bytes, 0);         // triangles
+        append_u32(bytes, 1);         // vertices
+        append_u32(bytes, 1);         // morph targets
+        append_f32(bytes, 0.1F); append_f32(bytes, 0.2F); // UV1
+        append_f32(bytes, 0.3F); append_f32(bytes, 0.4F); // UV2
+        append_f32(bytes, 0); append_f32(bytes, 0); append_f32(bytes, 0); append_f32(bytes, 1);
+        append_u32(bytes, 1); append_u32(bytes, 0);
+        append_f32(bytes, 0); append_f32(bytes, 0); append_f32(bytes, 0);
+        const auto document = rws::Document::from_bytes(std::move(bytes));
+        const auto geometry = rws::decode_geometry(document.chunks()[0], document.bytes());
+        assert(geometry && geometry.value->texcoord_sets == 2);
+        assert(geometry.value->texcoord_offsets.size() == 2);
+        assert(geometry.value->texcoord_offsets[1] - geometry.value->texcoord_offsets[0] == 8);
+    }
+    {
         std::vector<std::byte> bytes;
         append_header(bytes, 0x050E, 32);
         append_u32(bytes, 0); // flags: triangle list

@@ -27,7 +27,10 @@ private:
     };
     struct Uv { float u{}, v{}; };
     struct GpuVertex {
-        float x{}, y{}, z{}, u{}, v{}, nx{}, ny{}, nz{};
+        float x{}, y{}, z{};
+        float base_u{}, base_v{}, debug_u{}, debug_v{};
+        float nx{}, ny{}, nz{};
+        std::uint32_t source_index{};
     };
     struct DrawBatch {
         std::uint16_t material{};
@@ -36,6 +39,7 @@ private:
 
     bool load(const rws::Chunk& geometry_chunk, std::span<const std::byte> bytes,
               const std::filesystem::path& source_path);
+    void select_uv_set(std::size_t index);
     void reset_view();
     static void render_callback(const ImDrawList*, const ImDrawCmd* command);
     void render_gpu();
@@ -44,7 +48,7 @@ private:
 
     std::uint64_t chunk_offset_{~std::uint64_t{}};
     std::vector<rws::Vec3> vertices_;
-    std::vector<Uv> uvs_;
+    std::vector<std::vector<Uv>> uv_sets_;
     std::vector<Face> faces_;
     std::vector<GpuVertex> gpu_vertices_;
     std::vector<DrawBatch> draw_batches_;
@@ -64,6 +68,7 @@ private:
     float pan_x_{}, pan_y_{};
     float canvas_x_{}, canvas_y_{}, canvas_width_{}, canvas_height_{};
     int view_style_{};
+    std::size_t selected_uv_set_{};
     bool wireframe_{true};
     bool cull_backfaces_{};
     std::string error_;

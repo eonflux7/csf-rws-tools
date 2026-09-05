@@ -275,7 +275,7 @@ void GeometryPreview::clear() {
     if (checker_texture_ != 0) glDeleteTextures(1, &checker_texture_);
     chunk_offset_ = ~std::uint64_t{};
     vertices_.clear();
-    uvs_.clear();
+    uv_sets_.clear();
     faces_.clear();
     gpu_vertices_.clear();
     draw_batches_.clear();
@@ -286,7 +286,25 @@ void GeometryPreview::clear() {
     checker_texture_ = 0;
     loaded_texture_count_ = missing_texture_count_ = 0;
     texture_status_.clear();
+    selected_uv_set_ = 0;
     error_.clear();
+}
+
+void GeometryPreview::select_uv_set(const std::size_t index) {
+    if (index >= uv_sets_.size()) return;
+    selected_uv_set_ = index;
+    const auto& selected = uv_sets_[selected_uv_set_];
+    for (auto& vertex : gpu_vertices_) {
+        const auto uv = vertex.source_index < selected.size() ? selected[vertex.source_index] : Uv{};
+        vertex.debug_u = uv.u;
+        vertex.debug_v = uv.v;
+    }
+    if (vertex_buffer_ != 0) {
+        auto& gl = gl_api();
+        gl.bind_buffer(gl_array_buffer, vertex_buffer_);
+        gl.buffer_data(gl_array_buffer, static_cast<GlSizePtr>(gpu_vertices_.size() * sizeof(GpuVertex)),
+                       gpu_vertices_.data(), gl_static_draw);
+    }
 }
 
 void GeometryPreview::reset_view() {
@@ -315,17 +333,20 @@ bool GeometryPreview::load(const rws::Chunk& geometry_chunk,
         error_ = "Geometry has no non-native vertex array";
         return false;
     }
-    if (!geometry.value->texcoord_offsets.empty()) {
-        const auto uv_offset = geometry.value->texcoord_offsets.front();
+    uv_sets_.reserve(geometry.value->texcoord_offsets.size());
+    for (const auto uv_offset : geometry.value->texcoord_offsets) {
         const auto uv_bytes = static_cast<std::uint64_t>(geometry.value->vertex_count) * 8U;
         if (uv_offset <= bytes.size() && uv_bytes <= bytes.size() - uv_offset) {
-            uvs_.reserve(static_cast<std::size_t>(geometry.value->vertex_count));
+            std::vector<Uv> uv_set;
+            uv_set.reserve(static_cast<std::size_t>(geometry.value->vertex_count));
             for (std::int32_t i = 0; i < geometry.value->vertex_count; ++i) {
                 const auto offset = uv_offset + static_cast<std::uint64_t>(i) * 8U;
-                uvs_.push_back({read_f32(bytes, offset), 1.0F - read_f32(bytes, offset + 4)});
+                uv_set.push_back({read_f32(bytes, offset), 1.0F - read_f32(bytes, offset + 4)});
             }
+            uv_sets_.push_back(std::move(uv_set));
         }
     }
+    if (view_style_ == 4 && uv_sets_.size() > 1) selected_uv_set_ = 1;
 
     if (const auto* material_list_chunk = rws::find_child(geometry_chunk, 0x08)) {
         const auto material_list = rws::decode_material_list(*material_list_chunk, bytes);
@@ -454,9 +475,13 @@ bool GeometryPreview::load(const rws::Chunk& geometry_chunk,
         if (normal_length > 0.0F) { nx /= normal_length; ny /= normal_length; nz /= normal_length; }
         const std::array indices{face.a, face.b, face.c};
         for (const auto index : indices) {
-            const auto uv = index < uvs_.size() ? uvs_[index] : Uv{};
+            const auto base_uv = !uv_sets_.empty() && index < uv_sets_.front().size() ?
+                uv_sets_.front()[index] : Uv{};
+            const auto debug_uv = selected_uv_set_ < uv_sets_.size() &&
+                index < uv_sets_[selected_uv_set_].size() ? uv_sets_[selected_uv_set_][index] : Uv{};
             const auto& vertex = vertices_[index];
-            gpu_vertices_.push_back({vertex.x, vertex.y, vertex.z, uv.u, uv.v, nx, ny, nz});
+            gpu_vertices_.push_back({vertex.x, vertex.y, vertex.z,
+                base_uv.u, base_uv.v, debug_uv.u, debug_uv.v, nx, ny, nz, index});
         }
         draw_batches_.back().count += 3;
     }
@@ -477,13 +502,15 @@ bool GeometryPreview::create_gpu_resources() {
     }
     constexpr const char* vertex_source = R"GLSL(#version 330 core
 layout(location=0) in vec3 aPosition;
-layout(location=1) in vec2 aUv;
-layout(location=2) in vec3 aNormal;
+layout(location=1) in vec2 aBaseUv;
+layout(location=2) in vec2 aDebugUv;
+layout(location=3) in vec3 aNormal;
 uniform vec3 uCenter;
 uniform float uYaw, uPitch, uDistance;
 uniform vec2 uPan;
 uniform float uAspect, uTanHalfFov, uNear, uFar;
 out vec2 vUv;
+out vec2 vDebugUv;
 out vec3 vNormal;
 void main() {
     vec3 p = aPosition - uCenter;
@@ -495,18 +522,22 @@ void main() {
     float f=1.0/uTanHalfFov;
     gl_Position=vec4(view.x*f/uAspect, view.y*f,
         ((uFar+uNear)/(uNear-uFar))*view.z+(2.0*uFar*uNear)/(uNear-uFar), -view.z);
-    vUv=aUv;
+    vUv=aBaseUv;
+    vDebugUv=aDebugUv;
 })GLSL";
     constexpr const char* fragment_source = R"GLSL(#version 330 core
 in vec2 vUv;
+in vec2 vDebugUv;
 in vec3 vNormal;
 uniform sampler2D uTexture;
 uniform bool uUseTexture;
+uniform bool uUseDebugUv;
 uniform vec4 uBaseColor;
 out vec4 FragColor;
 void main() {
     float light=0.42+0.58*abs(dot(normalize(vNormal), normalize(vec3(0.35,0.55,0.75))));
-    vec4 color=uUseTexture ? texture(uTexture,vUv) : uBaseColor;
+    vec2 uv=uUseDebugUv ? vDebugUv : vUv;
+    vec4 color=uUseTexture ? texture(uTexture,uv) : uBaseColor;
     if (color.a < 0.08) discard;
     FragColor=vec4(color.rgb*light,color.a);
 })GLSL";
@@ -553,9 +584,14 @@ void main() {
     gl.enable_vertex_attrib_array(0);
     gl.vertex_attrib_pointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(GpuVertex), reinterpret_cast<void*>(offsetof(GpuVertex, x)));
     gl.enable_vertex_attrib_array(1);
-    gl.vertex_attrib_pointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(GpuVertex), reinterpret_cast<void*>(offsetof(GpuVertex, u)));
+    gl.vertex_attrib_pointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(GpuVertex),
+                             reinterpret_cast<void*>(offsetof(GpuVertex, base_u)));
     gl.enable_vertex_attrib_array(2);
-    gl.vertex_attrib_pointer(2, 3, GL_FLOAT, GL_FALSE, sizeof(GpuVertex), reinterpret_cast<void*>(offsetof(GpuVertex, nx)));
+    gl.vertex_attrib_pointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(GpuVertex),
+                             reinterpret_cast<void*>(offsetof(GpuVertex, debug_u)));
+    gl.enable_vertex_attrib_array(3);
+    gl.vertex_attrib_pointer(3, 3, GL_FLOAT, GL_FALSE, sizeof(GpuVertex),
+                             reinterpret_cast<void*>(offsetof(GpuVertex, nx)));
     gl.bind_vertex_array(0);
     return true;
 }
@@ -612,7 +648,9 @@ void GeometryPreview::render_gpu() {
     gl.uniform_1f(gl.get_uniform_location(shader_program_, "uFar"), far_plane);
     gl.uniform_1i(gl.get_uniform_location(shader_program_, "uTexture"), 0);
     const GLint use_texture_location = gl.get_uniform_location(shader_program_, "uUseTexture");
+    const GLint use_debug_uv_location = gl.get_uniform_location(shader_program_, "uUseDebugUv");
     const GLint base_color_location = gl.get_uniform_location(shader_program_, "uBaseColor");
+    gl.uniform_1i(use_debug_uv_location, view_style_ == 3 || view_style_ == 4);
 
     auto set_color = [&](const std::uint16_t material) {
         if (view_style_ == 1) {
@@ -630,25 +668,26 @@ void GeometryPreview::render_gpu() {
                       rgba[2] / 255.0F, rgba[3] / 255.0F);
     };
 
-    if (view_style_ != 4) {
+    if (view_style_ != 5) {
         glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
         for (const auto& batch : draw_batches_) {
             const auto material = static_cast<std::size_t>(batch.material);
             GLuint texture{};
-            if (view_style_ == 0 && uvs_.size() == vertices_.size() && material < material_textures_.size())
+            if (view_style_ == 0 && !uv_sets_.empty() && material < material_textures_.size())
                 texture = material_textures_[material];
-            else if (view_style_ == 3 && uvs_.size() == vertices_.size()) texture = checker_texture_;
+            else if ((view_style_ == 3 || view_style_ == 4) && selected_uv_set_ < uv_sets_.size())
+                texture = checker_texture_;
             gl.uniform_1i(use_texture_location, texture != 0);
             if (texture) glBindTexture(GL_TEXTURE_2D, texture);
             else set_color(batch.material);
             glDrawArrays(GL_TRIANGLES, static_cast<GLint>(batch.first), static_cast<GLsizei>(batch.count));
         }
     }
-    if (view_style_ == 4 || wireframe_) {
+    if (view_style_ == 5 || wireframe_) {
         gl.uniform_1i(use_texture_location, 0);
-        const float color = view_style_ == 4 ? 0.84F : 0.09F;
-        gl.uniform_4f(base_color_location, color, view_style_ == 4 ? 0.88F : 0.10F,
-                      view_style_ == 4 ? 0.95F : 0.13F, 1.0F);
+        const float color = view_style_ == 5 ? 0.84F : 0.09F;
+        gl.uniform_4f(base_color_location, color, view_style_ == 5 ? 0.88F : 0.10F,
+                      view_style_ == 5 ? 0.95F : 0.13F, 1.0F);
         glDepthFunc(GL_LEQUAL);
         glEnable(GL_POLYGON_OFFSET_LINE);
         glPolygonOffset(-1.0F, -1.0F);
@@ -667,17 +706,43 @@ void GeometryPreview::draw(const rws::Chunk& geometry_chunk,
                            const std::filesystem::path& source_path) {
     if (chunk_offset_ != geometry_chunk.offset) load(geometry_chunk, bytes, source_path);
 
-    constexpr const char* styles[] = {"Textured", "Material index", "Material color", "UV checker", "Wireframe"};
+    constexpr const char* styles[] = {
+        "Textured", "Material index", "Material color", "UV checker", "Lightmap UV", "Wireframe"};
     ImGui::SetNextItemWidth(150.0F);
-    ImGui::Combo("View style", &view_style_, styles, static_cast<int>(std::size(styles))); ImGui::SameLine();
-    if (view_style_ != 4) { ImGui::Checkbox("Wire overlay", &wireframe_); ImGui::SameLine(); }
+    if (ImGui::Combo("View style", &view_style_, styles, static_cast<int>(std::size(styles))) &&
+        view_style_ == 4 && uv_sets_.size() > 1)
+        select_uv_set(1);
+    ImGui::SameLine();
+    if (view_style_ != 5) { ImGui::Checkbox("Wire overlay", &wireframe_); ImGui::SameLine(); }
     ImGui::Checkbox("Cull backfaces", &cull_backfaces_); ImGui::SameLine();
     if (ImGui::Button("Frame geometry")) reset_view(); ImGui::SameLine();
     if (ImGui::Button("Reload edited bytes")) load(geometry_chunk, bytes, source_path);
     if (view_style_ == 0) {
         ImGui::Text("DDS files: %zu loaded | material slots unresolved: %zu | UV set: %s", loaded_texture_count_,
-            missing_texture_count_, uvs_.size() == vertices_.size() ? "present" : "missing");
+            missing_texture_count_, !uv_sets_.empty() ? "present" : "missing");
         if (!texture_status_.empty()) { ImGui::SameLine(); ImGui::TextDisabled("%s", texture_status_.c_str()); }
+    }
+    if (view_style_ == 3 || view_style_ == 4) {
+        if (uv_sets_.empty()) {
+            ImGui::TextColored(ImVec4(1, 0.55F, 0.25F, 1), "This geometry has no UV sets.");
+        } else {
+            const std::string preview = "UV set " + std::to_string(selected_uv_set_ + 1);
+            ImGui::SetNextItemWidth(120.0F);
+            if (ImGui::BeginCombo("UV channel", preview.c_str())) {
+                for (std::size_t i = 0; i < uv_sets_.size(); ++i) {
+                    const std::string label = "UV set " + std::to_string(i + 1) +
+                        (i == 1 ? " (lightmap convention)" : "");
+                    if (ImGui::Selectable(label.c_str(), selected_uv_set_ == i)) select_uv_set(i);
+                    if (selected_uv_set_ == i) ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled("%zu channel%s available", uv_sets_.size(), uv_sets_.size() == 1 ? "" : "s");
+            if (view_style_ == 4 && uv_sets_.size() < 2)
+                ImGui::TextColored(ImVec4(1, 0.55F, 0.25F, 1),
+                                   "UV2 is absent; showing the selected channel instead.");
+        }
     }
     ImGui::TextDisabled("Left drag: orbit | Middle/right drag: pan | Wheel: zoom | Double-click: frame");
 

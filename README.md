@@ -13,7 +13,8 @@ Current capabilities:
   save-to-copy behavior;
 - embedded depth-tested OpenGL Geometry preview with orbit/pan/zoom, external DXT1/DXT3 DDS
   textures, material debug colors, UV checker, lit-solid and wireframe modes,
-  optional backface culling, and automatic framing;
+  selectable UV channels, a dedicated lightmap-UV checker, optional backface
+  culling, and automatic framing;
 - typed views for Clump, Frame List, Geometry, Material List/Material, Atomic,
   World, Plane Section, Atomic Section, Skin, HAnim, User Data, Bin Mesh, and
   other standard plugin structures;
@@ -58,8 +59,10 @@ An asset can also be dropped onto the GUI. The first Geometry is selected
 automatically; selecting a Geometry or one of its child chunks opens the `3D Preview`
 tab. Left-drag orbits, middle/right-drag pans, the wheel zooms, and double-clicking
 frames the mesh. The view selector switches between Textured, Material index,
-Material color, UV checker, and Wireframe modes. Texture references are resolved
-against a sibling `Textures` directory and loaded from DXT1/DXT3 DDS files.
+Material color, UV checker, Lightmap UV, and Wireframe modes. The checker modes can
+inspect any stored UV channel; Lightmap UV selects UV2 when present. Texture
+references are resolved against a sibling `Textures` directory and loaded from
+DXT1/DXT3 DDS files.
 Selecting a Geometry also enables local-space OBJ export. `Save copy` writes
 `<original>.edited.rws`; it never overwrites the source file.
 

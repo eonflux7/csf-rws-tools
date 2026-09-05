@@ -57,6 +57,8 @@ views in the GUI.
   budget for large meshes.
 - [x] Resolve Material texture references and preview external DXT1/DXT3 DDS files,
   with Textured, Material Index, Material Color, UV Checker, and Wireframe styles.
+- [x] Add selectable geometry UV channels and a Lightmap UV checker that defaults
+  to the conventional second UV set.
 - Assemble Clump previews from Atomic geometry/frame indices and hierarchical frame
   transforms.
 - Add selectable Physics primitive and ragdoll overlays.
