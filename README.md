@@ -6,6 +6,8 @@ provides the `rws-man` graphical chunk browser and 3D scene preview, command-lin
 analysis tools, OBJ/glTF export, and a Blender add-on for inspecting and rebaking
 the game's lightmaps.
 
+![Assembled Commandos: Strike Force scene preview in rws-man](docs/images/csf-rws-tools-scene-preview.png)
+
 The project is under active development. It understands many structures used by
 *Commandos: Strike Force*, but it is not a general-purpose RenderWare editor and
 does not claim complete format support. Unknown and truncated data is preserved so
