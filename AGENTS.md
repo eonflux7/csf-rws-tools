@@ -7,6 +7,6 @@
 - Do not edit or commit generated content under `build*`, `_deps`, or Python `__pycache__` directories.
 - `rws_core` contains parsing/export logic; `rws-man` is the GUI; `rws-info` and `rws-corpus` are console tools.
 - Tests belong in `tests/document_tests.cpp`. Run `./test.ps1` after changes to parser, decoder, or export behavior.
-- Unpacked game resources are at `C:\Users\eon\Desktop\CSF_unpacks`. Treat them as read-only reference data and do not copy them into the repository.
+- Treat any locally available unpacked game resources as read-only reference data and do not copy them into the repository.
 - Preserve unknown/truncated RWS data and write modified assets to new files unless the user explicitly requests an overwrite.
 - The worktree may contain ongoing user changes; preserve unrelated modifications.

@@ -1,6 +1,6 @@
 # Extracted-game RWS corpus
 
-Full resource root inspected: `C:\Users\eon\Desktop\CSF_unpacks`, 2026-09-05.
+Full unpacked *Commandos: Strike Force* resource corpus inspected on 2026-09-05.
 
 The complete unpacked set contains 410 `.rws` files totaling 295,884,822 bytes;
 all 410 load without a fatal parser error. Fourteen map streams contain 4,989 CSF
@@ -160,7 +160,7 @@ Graphics Skin semantics onto the unrelated Physics ragdoll stream.
 ## Reproducible scan
 
 ```powershell
-.\build\Release\rws-corpus.exe C:\Users\eon\Desktop\Panzers
+.\build\Release\rws-corpus.exe "C:\path\to\extracted-game"
 ```
 
 The scanner reports every RWS path, size, root format, decoded library/build stamp,

@@ -10,8 +10,7 @@ validation.
 The strongest available baseline is the preserved RenderWare Graphics 3.7.0.2 SDK
 and its documentation:
 
-- Local RenderWare Studio 2.0.1 source and bundled Graphics SDK:
-  `C:\Users\eon\Downloads\rwstudio-v2.0.1-main`
+- RenderWare Studio 2.0.1 source and its bundled Graphics SDK.
 - <https://github.com/sigmaco/rwsdk-v3.7.0.2>
 - <https://rwsreader.sourceforge.net/>
 - <https://gtamods.com/wiki/RenderWare_binary_stream_file>

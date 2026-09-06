@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  core-tests:
+    name: Core tests
+    runs-on: windows-2025-vs2026
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Build and test core
+        shell: pwsh
+        run: ./test.ps1 -CoreOnly
+
+  gui-build:
+    name: GUI build
+    runs-on: windows-2025-vs2026
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Build GUI
+        shell: pwsh
+        run: ./build.ps1 -Target rws-man
