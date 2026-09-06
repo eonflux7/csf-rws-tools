@@ -1,6 +1,6 @@
-# CSF RWS Tools
+# csf-rws-tools
 
-CSF RWS Tools is a Windows inspection and reverse-engineering toolkit for
+csf-rws-tools is a Windows inspection and reverse-engineering toolkit for
 RenderWare Binary Stream (`.rws`) assets from *Commandos: Strike Force*. It
 provides the `rws-man` graphical chunk browser and 3D scene preview, command-line
 analysis tools, OBJ/glTF export, and a Blender add-on for inspecting and rebaking
@@ -274,4 +274,4 @@ redistribute it.
 
 ## License
 
-CSF RWS Tools is available under the [MIT License](LICENSE).
+csf-rws-tools is available under the [MIT License](LICENSE).
