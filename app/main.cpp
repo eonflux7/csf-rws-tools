@@ -581,7 +581,7 @@ int run_app(const std::optional<std::filesystem::path>& initial_path) {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_DEPTH_BITS, 24);
-    auto* window = glfwCreateWindow(1400, 850, "rws-man", nullptr, nullptr);
+    auto* window = glfwCreateWindow(1400, 850, "CSF RWS Tools - rws-man", nullptr, nullptr);
     if (!window) {
         glfwTerminate();
         return 1;
@@ -628,7 +628,7 @@ int run_app(const std::optional<std::filesystem::path>& initial_path) {
         int width = 0, height = 0;
         glfwGetFramebufferSize(window, &width, &height);
         ImGui::SetNextWindowSize(ImVec2(static_cast<float>(width), static_cast<float>(height)));
-        ImGui::Begin("rws-man", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+        ImGui::Begin("CSF RWS Tools", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
             ImGuiWindowFlags_NoResize | ImGuiWindowFlags_MenuBar);
         if (ImGui::BeginMenuBar()) {
             if (document && ImGui::MenuItem("Save copy", nullptr, false, true)) {

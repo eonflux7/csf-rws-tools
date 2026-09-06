@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(rws-man VERSION 0.1.0 LANGUAGES CXX)
+project(csf-rws-tools VERSION 0.1.0 LANGUAGES CXX)
 
 option(RWSMAN_BUILD_GUI "Build the Dear ImGui desktop application" ON)
 option(RWSMAN_BUILD_TESTS "Build parser tests" ON)

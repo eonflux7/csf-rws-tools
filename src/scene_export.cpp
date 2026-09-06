@@ -645,7 +645,7 @@ SceneExportStats export_scene_gltf(const std::vector<Chunk>& chunks,
     if (!bin_output) throw std::runtime_error("Failed while writing " + bin_path.string());
 
     std::ostringstream json;
-    json << std::setprecision(9) << "{\n  \"asset\": {\"version\": \"2.0\", \"generator\": \"rws-man\", "
+    json << std::setprecision(9) << "{\n  \"asset\": {\"version\": \"2.0\", \"generator\": \"CSF RWS Tools\", "
          << "\"extras\": {\"rws_units_per_meter\": 100}},\n"
          << "  \"scene\": 0,\n  \"scenes\": [{\"name\": \"RWS Scene\", \"nodes\": [";
     for (std::size_t i = 0; i < meshes.size(); ++i) { if (i) json << ','; json << i; }

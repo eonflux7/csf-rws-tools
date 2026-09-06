@@ -1,10 +1,10 @@
-# rws-man
+# CSF RWS Tools
 
-`rws-man` is a Windows viewer, inspection tool, and reverse-engineering workspace
-for RenderWare Binary Stream (`.rws`) assets from *Commandos: Strike Force*.
-It provides a graphical chunk browser and 3D scene preview, command-line analysis
-tools, OBJ/glTF export, and a Blender add-on for inspecting and rebaking the game's
-lightmaps.
+CSF RWS Tools is a Windows inspection and reverse-engineering toolkit for
+RenderWare Binary Stream (`.rws`) assets from *Commandos: Strike Force*. It
+provides the `rws-man` graphical chunk browser and 3D scene preview, command-line
+analysis tools, OBJ/glTF export, and a Blender add-on for inspecting and rebaking
+the game's lightmaps.
 
 The project is under active development. It understands many structures used by
 *Commandos: Strike Force*, but it is not a general-purpose RenderWare editor and
@@ -274,4 +274,4 @@ redistribute it.
 
 ## License
 
-`rws-man` is available under the [MIT License](LICENSE).
+CSF RWS Tools is available under the [MIT License](LICENSE).
