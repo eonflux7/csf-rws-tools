@@ -1,5 +1,7 @@
 /build*/
 /.vs/
 /.vscode/
+/imgui.ini
+**/__pycache__/
+*.py[cod]
 *.edited.rws
-

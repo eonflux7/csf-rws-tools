@@ -1,0 +1,92 @@
+{
+  "version": 5,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 24,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Visual Studio 18 2026"
+    },
+    {
+      "name": "default",
+      "displayName": "Full Windows build",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "FETCHCONTENT_UPDATES_DISCONNECTED": "ON",
+        "RWSMAN_BUILD_GUI": "ON",
+        "RWSMAN_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "core",
+      "displayName": "Core, CLI, and tests only",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build-core",
+      "cacheVariables": {
+        "RWSMAN_BUILD_GUI": "OFF",
+        "RWSMAN_BUILD_TESTS": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "debug",
+      "configurePreset": "default",
+      "configuration": "Debug"
+    },
+    {
+      "name": "release",
+      "configurePreset": "default",
+      "configuration": "Release"
+    },
+    {
+      "name": "core-debug",
+      "configurePreset": "core",
+      "configuration": "Debug"
+    },
+    {
+      "name": "core-release",
+      "configurePreset": "core",
+      "configuration": "Release"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "debug",
+      "configurePreset": "default",
+      "configuration": "Debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "release",
+      "configurePreset": "default",
+      "configuration": "Release",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "core-debug",
+      "configurePreset": "core",
+      "configuration": "Debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "core-release",
+      "configurePreset": "core",
+      "configuration": "Release",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}

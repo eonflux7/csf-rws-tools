@@ -61,13 +61,18 @@ int main(const int argc, char** argv) {
 
     std::map<RootKey, Stats> roots;
     std::map<std::uint32_t, Stats> chunks;
-    std::uint64_t total_bytes{}, warning_files{}, failed_files{};
-    std::cout << "file\tbytes\troot\tversion/build\tdiagnostics\n";
+    std::uint64_t total_bytes{}, warning_files{}, failed_files{}, instance_files{}, total_instances{};
+    std::map<std::uint32_t, std::uint64_t> instance_prototypes;
+    std::cout << "file\tbytes\troot\tversion/build\tinstances\tdiagnostics\n";
     for (const auto& path : files) {
         try {
             const auto document = rws::Document::load(path);
             total_bytes += document.bytes().size();
             warning_files += document.diagnostics().empty() ? 0U : 1U;
+            instance_files += document.scene_instances().empty() ? 0U : 1U;
+            total_instances += document.scene_instances().size();
+            for (const auto& instance : document.scene_instances())
+                ++instance_prototypes[instance.prototype_id];
             collect(document.chunks(), chunks);
             std::cout << std::filesystem::relative(path, root, error).string() << '\t'
                       << document.bytes().size() << '\t';
@@ -82,7 +87,8 @@ int main(const int argc, char** argv) {
             } else {
                 std::cout << "none\tunknown";
             }
-            std::cout << '\t' << document.diagnostics().size() << '\n';
+            std::cout << '\t' << document.scene_instances().size()
+                      << '\t' << document.diagnostics().size() << '\n';
         } catch (const std::exception& exception) {
             ++failed_files;
             std::cerr << path.string() << ": " << exception.what() << '\n';
@@ -91,6 +97,13 @@ int main(const int argc, char** argv) {
 
     std::cout << "\nCorpus: " << files.size() << " files, " << total_bytes << " bytes, "
               << warning_files << " files with diagnostics, " << failed_files << " failed loads\n";
+    std::cout << "CSF scene instances: " << total_instances << " records in " << instance_files
+              << " files\n";
+    if (!instance_prototypes.empty()) {
+        std::cout << "Instance prototypes:\n";
+        for (const auto& [prototype, count] : instance_prototypes)
+            std::cout << "  " << prototype << "\t" << count << '\n';
+    }
     std::cout << "\nRoot formats:\n";
     for (const auto& [key, value] : roots) {
         const auto version = rws::decode_library_id(key.stamp);
@@ -109,4 +122,3 @@ int main(const int argc, char** argv) {
     }
     return failed_files == 0 ? 0 : 1;
 }
-

@@ -152,6 +152,7 @@ struct PyroExtensionInfo {
     std::uint32_t version{};
     bool present{};
     std::vector<std::uint32_t> words;
+    std::vector<std::uint8_t> world_sector_vertex_bytes;
     std::vector<std::string> strings;
     std::optional<std::array<float, 6>> bounds;
     [[nodiscard]] std::optional<std::uint32_t> material_flags() const noexcept {
@@ -163,6 +164,11 @@ struct PyroExtensionInfo {
     [[nodiscard]] std::string_view object_name() const noexcept {
         return (owner_type == 0x07 || owner_type == 0x0E || owner_type == 0x14) && !strings.empty()
             ? std::string_view(strings.front()) : std::string_view{};
+    }
+    [[nodiscard]] std::optional<std::uint16_t> atomic_object_index() const noexcept {
+        if (owner_type != 0x14 || words.empty() || (words.front() & 0xFFFFU) == 0xFFFFU)
+            return std::nullopt;
+        return static_cast<std::uint16_t>(words.front() & 0xFFFFU);
     }
 };
 

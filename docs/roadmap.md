@@ -41,9 +41,11 @@ all extension payloads byte-for-byte.
   Definitions using the readers recovered from `CommXPC.exe`.
 - Recover final semantic names for the remaining conservative Body/Joint scalar
   fields and support `0x90B` Generic Definitions if samples are found.
-- Decode the scene/instance tail beginning at `0x00DD9095` in the ST05 sample.
-- Correlate length-prefixed names and record IDs with rendered clumps and in-game
-  entities.
+- [x] Decode the CSF scene-instance tail and its embedded Matrix/string records.
+- [x] Correlate prototype IDs with Pyro Atomic object indices using the executable's
+  lookup and clone path, then render/export the placements.
+- Recover semantic names for the three optional Atomic parameters and individual
+  placement flag bits.
 - Compare intact collision files to determine whether ST05's 1,944-byte deficit is
   file-specific or systematic.
 
@@ -61,18 +63,18 @@ views in the GUI.
   to the conventional second UV set.
 - [x] Resolve CSF's `*_Lm` textures from MatFX dual-pass material payloads and add
   lightmap-only and base-times-lightmap preview modes.
-- Assemble Clump previews from Atomic geometry/frame indices and hierarchical frame
-  transforms.
+- [x] Assemble Clump previews from Atomic geometry/frame indices and hierarchical
+  frame transforms.
 - Add selectable Physics primitive and ragdoll overlays.
 - Decode embedded/native rasters for assets that do not use external DDS files.
-- Assemble World Sector geometry after its vertex/triangle arrays are decoded.
+- [x] Assemble World Sector geometry after its vertex/triangle arrays are decoded.
 
 ## Phase 5 — extraction, rendering, and guarded editing
 
 - Material/texture binding and vertex-normal visualization in the preview.
 - World/collision visualization and object selection.
 - [x] Export local-space geometry to OBJ as an initial interchange path.
-- [ ] Export complete transformed scenes to glTF with materials and textures.
+- [x] Export complete transformed scenes to glTF with materials and texture references.
 - Typed edits with range/count propagation and transactional undo/redo.
 - Rebuild chunk sizes bottom-up, write to a new file, reopen it, and verify all
   boundaries before accepting the save.

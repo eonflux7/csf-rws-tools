@@ -753,11 +753,24 @@ DecodeResult<PyroExtensionInfo> decode_pyro_extension(const Chunk& chunk,
         return finish();
     }
     if (owner_type == 0x09) { // RpWorldSector, reader family at 0x006BF6F0
-        if (!read_word() || !read_word())
+        if (result.version != 1 || !read_word())
             return failure<PyroExtensionInfo>("Pyro World Sector payload is truncated");
         result.present = result.words.front() != 0;
-        while (reader.remaining() >= 4)
-            if (!read_word()) return failure<PyroExtensionInfo>("Pyro World Sector payload is truncated");
+        // The game's GetSize callback returns vertex_count + 12, but its writer
+        // emits only version + presence + vertex_count bytes. Consequently the
+        // declared payload swallows four bytes from the following chunk header.
+        if (reader.remaining() < 4)
+            return failure<PyroExtensionInfo>("Pyro World Sector over-declared tail is missing");
+        const auto vertex_bytes = result.present ? reader.remaining() - 4U : 0U;
+        result.world_sector_vertex_bytes.reserve(static_cast<std::size_t>(vertex_bytes));
+        for (std::uint64_t i = 0; i < vertex_bytes; ++i) {
+            std::uint8_t value{};
+            if (!reader.u8(value))
+                return failure<PyroExtensionInfo>("Pyro World Sector vertex data is truncated");
+            result.world_sector_vertex_bytes.push_back(value);
+        }
+        if (!reader.skip(reader.remaining()))
+            return failure<PyroExtensionInfo>("Pyro World Sector tail is truncated");
         return finish();
     }
     if (owner_type == 0x12) { // RpLight, reader 0x006BF7F0
@@ -840,7 +853,11 @@ DecodeResult<GeometryInfo> decode_geometry(const Chunk& parent, const std::span<
             stream_order = stream_order && item[0] < result.vertex_count && item[1] < result.vertex_count &&
                 item[3] < result.vertex_count && item[2] < result.material_count;
         }
-        if (stream_order && !memory_order) result.triangle_layout = TriangleLayout::stream_order;
+        // RpGeometry triangles are serialized as vertex1, vertex0, material,
+        // vertex2. A one-material mesh can make the in-memory interpretation
+        // pass the same range checks by coincidence; that is not a distinct
+        // on-disk layout, so prefer the documented stream order whenever valid.
+        if (stream_order) result.triangle_layout = TriangleLayout::stream_order;
         else if (memory_order && !stream_order) result.triangle_layout = TriangleLayout::memory_order;
         else if (result.triangle_count == 0) result.triangle_layout = TriangleLayout::stream_order;
     }

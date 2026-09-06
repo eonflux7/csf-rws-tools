@@ -1,6 +1,8 @@
 #include "rws/document.hpp"
 
 #include <algorithm>
+#include <bit>
+#include <cmath>
 #include <fstream>
 #include <limits>
 #include <sstream>
@@ -18,6 +20,10 @@ std::uint32_t read_u32(const std::span<const std::byte> data, const std::uint64_
            (std::to_integer<std::uint32_t>(data[i + 1]) << 8U) |
            (std::to_integer<std::uint32_t>(data[i + 2]) << 16U) |
            (std::to_integer<std::uint32_t>(data[i + 3]) << 24U);
+}
+
+float read_f32(const std::span<const std::byte> data, const std::uint64_t offset) {
+    return std::bit_cast<float>(read_u32(data, offset));
 }
 
 std::string at_offset(const std::string_view text, const std::uint64_t offset) {
@@ -86,6 +92,7 @@ void Document::set_byte(const std::uint64_t offset, const std::byte value) {
 
 void Document::parse() {
     chunks_.clear();
+    scene_instances_.clear();
     diagnostics_.clear();
     stream_library_id_.reset();
     if (bytes_.size() >= header_size) {
@@ -93,14 +100,34 @@ void Document::parse() {
     }
     parse_range(0, bytes_.size(), chunks_, 0, true);
 
+    // A CSF instance record can masquerade as one final top-level chunk. Its
+    // wrapper size does not describe the complete physical record, so remove
+    // that tentative chunk and consume the records with their own grammar.
+    std::optional<std::uint64_t> instance_begin;
+    const auto custom = std::find_if(chunks_.begin(), chunks_.end(), [](const Chunk& chunk) {
+        return chunk.type == 0x00016FC0U;
+    });
+    if (custom != chunks_.end()) {
+        instance_begin = custom->offset;
+        chunks_.erase(custom, chunks_.end());
+    }
+    const auto instance_end = instance_begin ? parse_scene_instances(*instance_begin) : 0U;
+    if (instance_begin && instance_end != 0) {
+        diagnostics_.erase(std::remove_if(diagnostics_.begin(), diagnostics_.end(),
+            [&](const Diagnostic& diagnostic) {
+                return diagnostic.offset >= *instance_begin && diagnostic.offset < instance_end &&
+                    diagnostic.message == "Remaining bytes are not a chunk sequence with the stream library ID";
+            }), diagnostics_.end());
+    }
+
     // CSF map streams may place a short game-specific instance table between
     // the ordinary top-level Clumps and an embedded RenderWare World. Recover
     // only a strongly identifiable World suffix: matching library stamp,
     // leading Struct child, and a declared end at (or just beyond) physical EOF.
     // The small overrun is retained as truncation instead of rewriting the file.
     if (stream_library_id_ && bytes_.size() >= header_size * 2) {
-        std::uint64_t scan_begin{};
-        if (!chunks_.empty())
+        std::uint64_t scan_begin = instance_end;
+        if (scan_begin == 0 && !chunks_.empty())
             scan_begin = chunks_.back().payload_offset + chunks_.back().available_size;
         for (std::uint64_t candidate = scan_begin;
              candidate + header_size * 2 <= bytes_.size(); ++candidate) {
@@ -117,11 +144,65 @@ void Document::parse() {
             if (recovered.size() == 1 && recovered.front().type == 0x0B) {
                 chunks_.push_back(std::move(recovered.front()));
                 diagnostics_.push_back({Diagnostic::Severity::warning, candidate,
-                    "Recovered RenderWare World after CSF-specific instance records"});
+                    scene_instances_.empty() ? "Recovered RenderWare World after opaque map data" :
+                    "Recovered RenderWare World after decoded CSF scene instances"});
             }
             break;
         }
     }
+}
+
+std::uint64_t Document::parse_scene_instances(const std::uint64_t begin) {
+    if (!stream_library_id_) return 0;
+    std::uint64_t cursor = begin;
+    while (cursor <= bytes_.size() && bytes_.size() - cursor >= 116U) {
+        if (read_u32(bytes_, cursor) != 0x00016FC0U ||
+            read_u32(bytes_, cursor + 8) != *stream_library_id_ ||
+            read_u32(bytes_, cursor + 36) != 0x0DU ||
+            read_u32(bytes_, cursor + 40) != 64U ||
+            read_u32(bytes_, cursor + 44) != *stream_library_id_ ||
+            read_u32(bytes_, cursor + 48) != 0x01U ||
+            read_u32(bytes_, cursor + 52) != 52U ||
+            read_u32(bytes_, cursor + 56) != *stream_library_id_)
+            break;
+
+        const auto name_size = static_cast<std::uint64_t>(read_u32(bytes_, cursor + 112));
+        const auto declared_size = static_cast<std::uint64_t>(read_u32(bytes_, cursor + 4));
+        if (name_size > 4096U || name_size > bytes_.size() - cursor - 116U ||
+            declared_size != 92U + name_size)
+            break;
+
+        SceneInstance instance;
+        instance.offset = cursor;
+        instance.declared_size = read_u32(bytes_, cursor + 4);
+        instance.prototype_id = read_u32(bytes_, cursor + 12);
+        instance.instance_id = read_u32(bytes_, cursor + 16);
+        instance.atomic_parameters = {read_f32(bytes_, cursor + 20), read_f32(bytes_, cursor + 24),
+                                      read_f32(bytes_, cursor + 28)};
+        instance.flags = read_u32(bytes_, cursor + 32);
+        for (std::size_t i = 0; i < instance.rotation.size(); ++i)
+            instance.rotation[i] = read_f32(bytes_, cursor + 60U + i * 4U);
+        instance.position = {read_f32(bytes_, cursor + 96), read_f32(bytes_, cursor + 100),
+                             read_f32(bytes_, cursor + 104)};
+        instance.matrix_flags = read_u32(bytes_, cursor + 108);
+        instance.prototype_name.reserve(static_cast<std::size_t>(name_size));
+        for (std::uint64_t i = 0; i < name_size; ++i)
+            instance.prototype_name.push_back(static_cast<char>(std::to_integer<unsigned char>(
+                bytes_[static_cast<std::size_t>(cursor + 116U + i)])));
+        instance.physical_size = 116U + name_size;
+
+        const auto finite = std::all_of(instance.rotation.begin(), instance.rotation.end(),
+            [](const float value) { return std::isfinite(value); }) &&
+            std::isfinite(instance.position.x) && std::isfinite(instance.position.y) &&
+            std::isfinite(instance.position.z) &&
+            std::all_of(instance.atomic_parameters.begin(), instance.atomic_parameters.end(),
+                        [](const float value) { return std::isfinite(value); });
+        if (!finite) break;
+        scene_instances_.push_back(std::move(instance));
+        cursor += scene_instances_.back().physical_size;
+    }
+    if (scene_instances_.empty()) return 0;
+    return cursor;
 }
 
 void Document::parse_range(const std::uint64_t begin, const std::uint64_t end,

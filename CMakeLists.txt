@@ -10,6 +10,7 @@ add_library(rws_core
     src/chunk_names.cpp
     src/decoded.cpp
     src/obj_export.cpp
+    src/scene_export.cpp
 )
 add_library(rws::core ALIAS rws_core)
 target_include_directories(rws_core PUBLIC include)
@@ -60,8 +61,11 @@ if(RWSMAN_BUILD_GUI)
     target_link_libraries(imgui_backend PUBLIC glfw OpenGL::GL)
     target_compile_features(imgui_backend PUBLIC cxx_std_20)
 
-    add_executable(rws-man app/main.cpp app/geometry_preview.cpp)
+    add_executable(rws-man WIN32 app/main.cpp app/geometry_preview.cpp)
     target_link_libraries(rws-man PRIVATE rws::core imgui_backend)
+    if(WIN32)
+        target_link_libraries(rws-man PRIVATE Shell32)
+    endif()
 endif()
 
 if(RWSMAN_BUILD_TESTS)

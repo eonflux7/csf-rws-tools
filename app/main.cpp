@@ -1,6 +1,14 @@
+#ifdef _WIN32
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <shellapi.h>
+#endif
+
 #include "rws/document.hpp"
 #include "rws/decoded.hpp"
 #include "rws/obj_export.hpp"
+#include "rws/scene_export.hpp"
 #include "geometry_preview.hpp"
 
 #include <GLFW/glfw3.h>
@@ -12,9 +20,11 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cmath>
 #include <cstdio>
 #include <exception>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -38,10 +48,28 @@ const rws::Chunk* find_chunk(const std::vector<rws::Chunk>& chunks, const std::u
     return nullptr;
 }
 
+const rws::SceneInstance* find_instance(const std::span<const rws::SceneInstance> instances,
+                                        const std::uint64_t offset) {
+    const auto found = std::find_if(instances.begin(), instances.end(),
+        [offset](const rws::SceneInstance& instance) { return instance.offset == offset; });
+    return found == instances.end() ? nullptr : &*found;
+}
+
 const rws::Chunk* find_first_chunk(const std::vector<rws::Chunk>& chunks, const std::uint32_t type) {
     for (const auto& chunk : chunks) {
         if (chunk.type == type) return &chunk;
         if (const auto* child = find_first_chunk(chunk.children, type)) return child;
+    }
+    return nullptr;
+}
+
+const rws::Chunk* find_enclosing_clump(const std::vector<rws::Chunk>& chunks,
+                                       const std::uint64_t offset,
+                                       const rws::Chunk* clump = nullptr) {
+    for (const auto& chunk : chunks) {
+        const auto* current = chunk.type == 0x10 ? &chunk : clump;
+        if (chunk.offset == offset) return current;
+        if (const auto* found = find_enclosing_clump(chunk.children, offset, current)) return found;
     }
     return nullptr;
 }
@@ -79,23 +107,159 @@ const rws::Chunk* find_owning_geometry(const std::vector<rws::Chunk>& chunks,
     return nullptr;
 }
 
-void draw_tree(const std::vector<rws::Chunk>& chunks, std::optional<std::uint64_t>& selected) {
+void draw_chunk_icon(const std::uint32_t type) {
+    auto* draw_list = ImGui::GetWindowDrawList();
+    const ImVec2 item_min = ImGui::GetItemRectMin();
+    const ImVec2 item_max = ImGui::GetItemRectMax();
+    const float size = std::min(12.0F, item_max.y - item_min.y - 4.0F);
+    const float left = item_min.x + ImGui::GetTreeNodeToLabelSpacing() + 1.0F;
+    const float top = item_min.y + (item_max.y - item_min.y - size) * 0.5F;
+    const float right = left + size;
+    const float bottom = top + size;
+    const float middle_x = (left + right) * 0.5F;
+    const float middle_y = (top + bottom) * 0.5F;
+    const ImU32 color = ImGui::GetColorU32(ImGuiCol_Text);
+    constexpr float stroke = 1.35F;
+
+    switch (type) {
+    case 0x01: // Struct: a data table.
+        draw_list->AddRect({left, top}, {right, bottom}, color, 1.0F, 0, stroke);
+        draw_list->AddLine({left + 3.0F, top}, {left + 3.0F, bottom}, color, stroke);
+        draw_list->AddLine({left, top + 4.0F}, {right, top + 4.0F}, color, stroke);
+        draw_list->AddLine({left, top + 8.0F}, {right, top + 8.0F}, color, stroke);
+        break;
+    case 0x03: // Extension: plug-in/puzzle piece.
+        draw_list->AddRect({left + 1.0F, top + 3.0F}, {right - 1.0F, bottom - 1.0F}, color,
+                           1.0F, 0, stroke);
+        draw_list->AddCircle({middle_x, top + 3.0F}, 2.2F, color, 8, stroke);
+        break;
+    case 0x06: // Texture: image frame.
+        draw_list->AddRect({left, top + 1.0F}, {right, bottom - 1.0F}, color, 1.0F, 0, stroke);
+        draw_list->AddCircleFilled({right - 3.0F, top + 4.0F}, 1.25F, color, 8);
+        draw_list->AddTriangleFilled({left + 1.5F, bottom - 2.0F}, {left + 5.0F, top + 6.0F},
+                                     {left + 8.0F, bottom - 2.0F}, color);
+        break;
+    case 0x07: // Material: shaded sphere.
+        draw_list->AddCircle({middle_x, middle_y}, size * 0.46F, color, 16, stroke);
+        draw_list->AddCircleFilled({middle_x - 2.0F, middle_y - 2.0F}, 2.0F, color, 10);
+        break;
+    case 0x08: // Material List: three swatches.
+        for (int row = 0; row < 3; ++row) {
+            const float y = top + 2.0F + row * 4.0F;
+            draw_list->AddCircleFilled({left + 2.0F, y}, 1.3F, color, 8);
+            draw_list->AddLine({left + 5.0F, y}, {right, y}, color, stroke);
+        }
+        break;
+    case 0x09: // Atomic Sector: filled terrain facet.
+        draw_list->AddTriangleFilled({middle_x, top}, {right, bottom}, {left, bottom}, color);
+        draw_list->AddLine({middle_x, top}, {middle_x, bottom}, ImGui::GetColorU32(ImGuiCol_WindowBg), 1.0F);
+        break;
+    case 0x0B: // World: globe.
+        draw_list->AddCircle({middle_x, middle_y}, size * 0.47F, color, 16, stroke);
+        draw_list->AddLine({left + 1.0F, middle_y}, {right - 1.0F, middle_y}, color, stroke);
+        draw_list->AddEllipse({middle_x, middle_y}, {size * 0.22F, size * 0.47F}, color, 0.0F, 12, stroke);
+        break;
+    case 0x0E: // Frame List: coordinate frame.
+        draw_list->AddCircleFilled({left + 3.0F, bottom - 3.0F}, 1.5F, color, 8);
+        draw_list->AddLine({left + 3.0F, bottom - 3.0F}, {right, bottom - 3.0F}, color, stroke);
+        draw_list->AddLine({left + 3.0F, bottom - 3.0F}, {left + 3.0F, top}, color, stroke);
+        draw_list->AddLine({left + 3.0F, bottom - 3.0F}, {right - 2.0F, top + 2.0F}, color, stroke);
+        break;
+    case 0x0F: // Geometry: wireframe triangle.
+        draw_list->AddTriangle({middle_x, top}, {right, bottom}, {left, bottom}, color, stroke);
+        draw_list->AddLine({middle_x, top}, {middle_x, bottom}, color, stroke);
+        break;
+    case 0x10: // Clump: grouped overlapping objects.
+        draw_list->AddRect({left, top + 3.0F}, {right - 3.0F, bottom}, color, 1.0F, 0, stroke);
+        draw_list->AddRect({left + 3.0F, top}, {right, bottom - 3.0F}, color, 1.0F, 0, stroke);
+        break;
+    case 0x14: // Atomic: single solid object.
+        draw_list->AddQuadFilled({middle_x, top}, {right, middle_y}, {middle_x, bottom},
+                                 {left, middle_y}, color);
+        break;
+    default:
+        draw_list->AddCircleFilled({middle_x, middle_y}, 2.0F, color, 8);
+        break;
+    }
+}
+
+void find_clump_size_range(const std::vector<rws::Chunk>& chunks, float& minimum, float& maximum) {
+    for (const auto& chunk : chunks) {
+        if (chunk.type == 0x10) {
+            const float size = std::log1p(static_cast<float>(chunk.declared_size));
+            minimum = std::min(minimum, size);
+            maximum = std::max(maximum, size);
+        }
+        find_clump_size_range(chunk.children, minimum, maximum);
+    }
+}
+
+ImVec4 clump_size_color(const rws::Chunk& chunk, const float minimum, const float maximum) {
+    const float denominator = maximum - minimum;
+    const float t = denominator > 0.0001F ?
+        std::clamp((std::log1p(static_cast<float>(chunk.declared_size)) - minimum) / denominator, 0.0F, 1.0F) :
+        0.5F;
+    constexpr ImVec4 grey{0.58F, 0.60F, 0.64F, 1.0F};
+    constexpr ImVec4 green{0.31F, 0.78F, 0.43F, 1.0F};
+    constexpr ImVec4 orange{1.0F, 0.56F, 0.20F, 1.0F};
+    const auto blend = [](const ImVec4& from, const ImVec4& to, const float amount) {
+        return ImVec4{from.x + (to.x - from.x) * amount, from.y + (to.y - from.y) * amount,
+                      from.z + (to.z - from.z) * amount, 1.0F};
+    };
+    return t < 0.5F ? blend(grey, green, t * 2.0F) : blend(green, orange, (t - 0.5F) * 2.0F);
+}
+
+void draw_tree(const std::vector<rws::Chunk>& chunks, std::optional<std::uint64_t>& selected,
+               const float minimum_clump_size, const float maximum_clump_size,
+               const bool reveal_selected) {
     for (const auto& chunk : chunks) {
         const bool has_children = !chunk.children.empty();
         ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth;
         if (!has_children) flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
         if (selected && *selected == chunk.offset) flags |= ImGuiTreeNodeFlags_Selected;
-        if (chunk.truncated) ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 170, 64, 255));
+        const bool colored = chunk.truncated || chunk.type == 0x10;
+        if (chunk.truncated)
+            ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 170, 64, 255));
+        else if (chunk.type == 0x10)
+            ImGui::PushStyleColor(ImGuiCol_Text, clump_size_color(chunk, minimum_clump_size, maximum_clump_size));
         const bool open = ImGui::TreeNodeEx(reinterpret_cast<void*>(static_cast<std::uintptr_t>(chunk.offset + 1)),
-            flags, "%s  @ 0x%llX  (%u)", rws::chunk_name(chunk.type).data(),
+            flags, "   %s  @ 0x%llX  (%u)", rws::chunk_name(chunk.type).data(),
             static_cast<unsigned long long>(chunk.offset), chunk.declared_size);
-        if (chunk.truncated) ImGui::PopStyleColor();
+        draw_chunk_icon(chunk.type);
+        if (colored) ImGui::PopStyleColor();
+        if (reveal_selected && selected && *selected == chunk.offset) ImGui::SetScrollHereY(0.5F);
         if (ImGui::IsItemClicked()) selected = chunk.offset;
         if (has_children && open) {
-            draw_tree(chunk.children, selected);
+            draw_tree(chunk.children, selected, minimum_clump_size, maximum_clump_size, reveal_selected);
             ImGui::TreePop();
         }
     }
+}
+
+void draw_instance_tree(const std::span<const rws::SceneInstance> instances,
+                        std::optional<std::uint64_t>& selected, const bool reveal_selected) {
+    if (instances.empty()) return;
+    const auto flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth;
+    if (!ImGui::TreeNodeEx("CSF Scene Instances", flags, "CSF Scene Instances (%zu)",
+                           instances.size()))
+        return;
+
+    ImGuiListClipper clipper;
+    clipper.Begin(static_cast<int>(instances.size()));
+    while (clipper.Step()) {
+        for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
+            const auto& instance = instances[static_cast<std::size_t>(i)];
+            const bool is_selected = selected && *selected == instance.offset;
+            std::ostringstream label;
+            label << (instance.prototype_name.empty() ? "Prototype " : instance.prototype_name);
+            if (instance.prototype_name.empty()) label << instance.prototype_id;
+            label << "  [instance " << instance.instance_id << "]  @ 0x" << std::hex
+                  << std::uppercase << instance.offset;
+            if (ImGui::Selectable(label.str().c_str(), is_selected)) selected = instance.offset;
+            if (reveal_selected && is_selected) ImGui::SetScrollHereY(0.5F);
+        }
+    }
+    ImGui::TreePop();
 }
 
 void draw_hex(rws::Document& document, const std::uint64_t begin, const std::uint64_t size) {
@@ -366,7 +530,10 @@ void draw_typed_details(const rws::Chunk& chunk, rws::Document& document, std::s
         break;
     }
     case 0xFFFFFF00U: {
-        const auto decoded = rws::decode_pyro_extension(chunk, parent_type, bytes);
+        // Short collision-World leaf declarations can make a World Sector plug-in
+        // appear directly below its enclosing Plane Section in the recovered tree.
+        const auto owner_type = parent_type == 0x0A ? 0x09U : parent_type;
+        const auto decoded = rws::decode_pyro_extension(chunk, owner_type, bytes);
         if (!decoded) { ImGui::TextDisabled("%s", decoded.error.c_str()); break; }
         const auto& value = *decoded.value;
         ImGui::Text("Pyro plugin | owner: %s (0x%X) | version: %u",
@@ -391,6 +558,13 @@ void draw_typed_details(const rws::Chunk& chunk, rws::Document& document, std::s
                 (*value.bounds)[0], (*value.bounds)[1], (*value.bounds)[2],
                 (*value.bounds)[3], (*value.bounds)[4], (*value.bounds)[5]);
         }
+        if (!value.world_sector_vertex_bytes.empty()) {
+            const auto [minimum, maximum] = std::minmax_element(
+                value.world_sector_vertex_bytes.begin(), value.world_sector_vertex_bytes.end());
+            ImGui::Text("World Sector per-vertex bytes: %zu (range %u..%u)",
+                value.world_sector_vertex_bytes.size(), static_cast<unsigned>(*minimum),
+                static_cast<unsigned>(*maximum));
+        }
         break;
     }
     default:
@@ -402,7 +576,7 @@ void draw_typed_details(const rws::Chunk& chunk, rws::Document& document, std::s
 
 } // namespace
 
-int main(int argc, char** argv) {
+int run_app(const std::optional<std::filesystem::path>& initial_path) {
     if (!glfwInit()) return 1;
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
@@ -438,7 +612,7 @@ int main(int argc, char** argv) {
             status = error.what();
         }
     };
-    if (argc > 1) load(argv[1]);
+    if (initial_path) load(*initial_path);
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
@@ -465,20 +639,59 @@ int main(int argc, char** argv) {
                     status = "Saved " + output.string();
                 } catch (const std::exception& error) { status = error.what(); }
             }
+            if (document && ImGui::MenuItem("Export whole scene (glTF)", nullptr, false, true)) {
+                try {
+                    auto output = document->source_path();
+                    output.replace_filename(output.stem().string() + ".scene.gltf");
+                    const auto stats = rws::export_scene_gltf(document->chunks(),
+                        document->scene_instances(), document->bytes(), output);
+                    std::ostringstream message;
+                    message << "Exported " << stats.atomic_instances << " atomic meshes ("
+                            << stats.custom_instances << " CSF placements, "
+                            << stats.unresolved_instances << " unresolved) and "
+                            << stats.world_sectors << " World sectors to " << output.string();
+                    status = message.str();
+                } catch (const std::exception& error) { status = error.what(); }
+            }
+            const auto* selected_clump = document && selected ?
+                find_enclosing_clump(document->chunks(), *selected) : nullptr;
+            if (ImGui::MenuItem("Export selected Clump (glTF)", nullptr, false,
+                                selected_clump != nullptr)) {
+                try {
+                    auto output = document->source_path();
+                    std::ostringstream suffix;
+                    suffix << document->source_path().stem().string() << ".clump_0x" << std::hex
+                           << std::uppercase << selected_clump->offset << ".gltf";
+                    output.replace_filename(suffix.str());
+                    const auto stats = rws::export_clump_gltf(
+                        *selected_clump, document->bytes(), output);
+                    status = "Exported Clump with " + std::to_string(stats.atomic_instances) +
+                             " Atomics to " + output.string();
+                } catch (const std::exception& error) { status = error.what(); }
+            }
             ImGui::EndMenuBar();
         }
         ImGui::TextUnformatted(status.c_str());
         ImGui::Separator();
         if (document) {
+            static std::optional<std::uint64_t> previous_selection;
+            float minimum_clump_size = std::numeric_limits<float>::max();
+            float maximum_clump_size = std::numeric_limits<float>::lowest();
+            find_clump_size_range(document->chunks(), minimum_clump_size, maximum_clump_size);
+            const bool reveal_selected = selected != previous_selection;
             ImGui::BeginChild("tree", ImVec2(490, 0), ImGuiChildFlags_Borders);
-            ImGui::Text("%zu bytes | %zu top-level chunks | %zu diagnostics%s",
-                document->bytes().size(), document->chunks().size(), document->diagnostics().size(),
+            ImGui::Text("%zu bytes | %zu chunks | %zu CSF instances | %zu diagnostics%s",
+                document->bytes().size(), document->chunks().size(), document->scene_instances().size(),
+                document->diagnostics().size(),
                 document->dirty() ? " | modified" : "");
-            draw_tree(document->chunks(), selected);
+            draw_tree(document->chunks(), selected, minimum_clump_size, maximum_clump_size, reveal_selected);
+            draw_instance_tree(document->scene_instances(), selected, reveal_selected);
             ImGui::EndChild();
+            previous_selection = selected;
             ImGui::SameLine();
             ImGui::BeginChild("details", ImVec2(0, 0), ImGuiChildFlags_Borders);
             const auto* chunk = selected ? find_chunk(document->chunks(), *selected) : nullptr;
+            const auto* instance = selected ? find_instance(document->scene_instances(), *selected) : nullptr;
             if (chunk) {
                 ImGui::Text("%s (0x%08X)", rws::chunk_name(chunk->type).data(), chunk->type);
                 ImGui::Text("Header: 0x%llX   Payload: 0x%llX", static_cast<unsigned long long>(chunk->offset),
@@ -492,8 +705,8 @@ int main(int argc, char** argv) {
                 const auto available_size = chunk->available_size;
                 const auto* owner = find_owning_object(document->chunks(), chunk->offset);
                 const auto* geometry = find_preview_geometry(*chunk, document->chunks());
-                if (geometry && ImGui::BeginTabBar("chunk_views")) {
-                    if (ImGui::BeginTabItem("3D Preview")) {
+                if (ImGui::BeginTabBar("chunk_views")) {
+                    if (geometry && ImGui::BeginTabItem("3D Preview")) {
                         if (chunk->type == 0x10 || chunk->type == 0x1A)
                             ImGui::TextDisabled("Previewing the first Geometry contained by this %s.",
                                 rws::chunk_name(chunk->type).data());
@@ -501,7 +714,8 @@ int main(int argc, char** argv) {
                         ImGui::EndTabItem();
                     }
                     if (ImGui::BeginTabItem("Whole RWS Scene")) {
-                        geometry_preview.draw_scene(document->chunks(), document->bytes(), document->source_path());
+                        geometry_preview.draw_scene(document->chunks(), document->bytes(),
+                            document->scene_instances(), document->source_path(), selected);
                         ImGui::EndTabItem();
                     }
                     if (ImGui::BeginTabItem("Inspector / Hex")) {
@@ -510,12 +724,48 @@ int main(int argc, char** argv) {
                         ImGui::EndTabItem();
                     }
                     ImGui::EndTabBar();
-                } else {
-                    draw_typed_details(*chunk, *document, status, owner ? owner->type : 0);
-                    draw_hex(*document, payload_offset, available_size);
+                }
+            } else if (instance) {
+                ImGui::Text("CSF Scene Instance @ 0x%llX",
+                            static_cast<unsigned long long>(instance->offset));
+                if (instance->prototype_id >= 1000U)
+                    ImGui::Text("Prototype: %u (Pyro object index %u)   Instance ID: %u",
+                                instance->prototype_id, instance->prototype_id - 1000U,
+                                instance->instance_id);
+                else
+                    ImGui::Text("Prototype: %u   Instance ID: %u", instance->prototype_id,
+                                instance->instance_id);
+                ImGui::Text("Name: %s", instance->prototype_name.empty() ? "(unnamed)" :
+                                                              instance->prototype_name.c_str());
+                ImGui::Text("Flags: 0x%08X   Declared: %u   Physical: %llu", instance->flags,
+                            instance->declared_size,
+                            static_cast<unsigned long long>(instance->physical_size));
+                ImGui::Text("Atomic parameters: %.6g, %.6g, %.6g",
+                            instance->atomic_parameters[0], instance->atomic_parameters[1],
+                            instance->atomic_parameters[2]);
+                ImGui::Text("Position: %.6g, %.6g, %.6g", instance->position.x,
+                            instance->position.y, instance->position.z);
+                ImGui::Text("Matrix flags: 0x%08X", instance->matrix_flags);
+                ImGui::Text("Rotation: [%.5g %.5g %.5g]", instance->rotation[0],
+                            instance->rotation[1], instance->rotation[2]);
+                ImGui::Text("          [%.5g %.5g %.5g]", instance->rotation[3],
+                            instance->rotation[4], instance->rotation[5]);
+                ImGui::Text("          [%.5g %.5g %.5g]", instance->rotation[6],
+                            instance->rotation[7], instance->rotation[8]);
+                if (ImGui::BeginTabBar("instance_views")) {
+                    if (ImGui::BeginTabItem("Whole RWS Scene")) {
+                        geometry_preview.draw_scene(document->chunks(), document->bytes(),
+                            document->scene_instances(), document->source_path(), selected);
+                        ImGui::EndTabItem();
+                    }
+                    if (ImGui::BeginTabItem("Raw record")) {
+                        draw_hex(*document, instance->offset, instance->physical_size);
+                        ImGui::EndTabItem();
+                    }
+                    ImGui::EndTabBar();
                 }
             } else {
-                ImGui::TextDisabled("Select a chunk to inspect its payload.");
+                ImGui::TextDisabled("Select a chunk or CSF scene instance to inspect it.");
             }
             ImGui::EndChild();
         }
@@ -536,3 +786,20 @@ int main(int argc, char** argv) {
     glfwTerminate();
     return 0;
 }
+
+#ifdef _WIN32
+int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    std::optional<std::filesystem::path> initial_path;
+    if (argv != nullptr && argc > 1) initial_path = argv[1];
+    if (argv != nullptr) LocalFree(argv);
+    return run_app(initial_path);
+}
+#else
+int main(int argc, char** argv) {
+    const std::optional<std::filesystem::path> initial_path =
+        argc > 1 ? std::optional<std::filesystem::path>(argv[1]) : std::nullopt;
+    return run_app(initial_path);
+}
+#endif

@@ -1,13 +1,18 @@
 #include "rws/document.hpp"
 #include "rws/decoded.hpp"
 #include "rws/obj_export.hpp"
+#include "rws/scene_export.hpp"
 
+#include <algorithm>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <map>
+#include <set>
 #include <sstream>
 #include <string>
+#include <tuple>
 
 namespace {
 
@@ -87,7 +92,10 @@ void validate_types(const std::vector<rws::Chunk>& chunks, const std::span<const
         case 0x907: { auto value = rws::decode_physics_body_def(chunk, bytes); error = value.error; break; }
         case 0x909: { auto value = rws::decode_physics_ragdoll_def(chunk, bytes); error = value.error; break; }
         case 0xFFFFFF00U: {
-            auto value = rws::decode_pyro_extension(chunk, enclosing_object_type, bytes); error = value.error; break;
+            // Several collision Worlds under-declare a leaf boundary, leaving its
+            // RpWorldSector extensions attached to the enclosing Plane Section.
+            const auto owner = enclosing_object_type == 0x0A ? 0x09U : enclosing_object_type;
+            auto value = rws::decode_pyro_extension(chunk, owner, bytes); error = value.error; break;
         }
         case 0x07: { auto value = rws::decode_material(chunk, bytes); error = value.error; break; }
         default: handled = false; break;
@@ -120,11 +128,70 @@ void export_geometries(const std::vector<rws::Chunk>& chunks, const std::span<co
     }
 }
 
+void print_instances(const rws::Document& document) {
+    struct GroupStats {
+        std::uint64_t count{};
+        std::uint32_t minimum_id{std::numeric_limits<std::uint32_t>::max()}, maximum_id{};
+    };
+    using Key = std::tuple<std::uint32_t, std::string, std::uint32_t, std::uint32_t>;
+    std::map<Key, GroupStats> groups;
+    std::set<std::uint32_t> prototype_ids;
+    for (const auto& instance : document.scene_instances()) {
+        auto& group = groups[{instance.prototype_id, instance.prototype_name,
+                              instance.flags, instance.declared_size}];
+        ++group.count;
+        group.minimum_id = std::min(group.minimum_id, instance.instance_id);
+        group.maximum_id = std::max(group.maximum_id, instance.instance_id);
+        prototype_ids.insert(instance.prototype_id);
+    }
+    std::cout << "CSF scene instances: " << document.scene_instances().size() << '\n';
+    for (const auto& [key, group] : groups) {
+        const auto& [prototype, name, flags, declared_size] = key;
+        std::cout << "  prototype=" << prototype << " count=" << group.count
+                  << " ids=" << group.minimum_id << ".." << group.maximum_id
+                  << " flags=0x" << std::hex << flags << std::dec
+                  << " declared=" << declared_size;
+        if (!name.empty()) std::cout << " name=\"" << name << '"';
+        std::cout << '\n';
+    }
+
+    std::cout << "Prototype correlation (prototype ID = 1000 + Pyro atomic object index):\n";
+    std::size_t clump_ordinal{};
+    for (const auto& clump : document.chunks()) {
+        if (clump.type != 0x10) continue;
+        std::size_t atomic_ordinal{};
+        for (const auto& atomic : clump.children) {
+            if (atomic.type != 0x14) continue;
+            const auto* extension = rws::find_child(atomic, 0x03);
+            const auto* pyro = extension ? rws::find_child(*extension, 0xFFFFFF00U) : nullptr;
+            const auto metadata = pyro ? rws::decode_pyro_extension(*pyro, 0x14, document.bytes()) :
+                                         rws::DecodeResult<rws::PyroExtensionInfo>{};
+            if (metadata) {
+                if (const auto object_index = metadata.value->atomic_object_index()) {
+                    const auto prototype_id = 1000U + *object_index;
+                    if (prototype_ids.contains(prototype_id)) {
+                    std::cout << "  clump=" << clump_ordinal << "@0x" << std::hex << clump.offset
+                              << std::dec << " atomic=" << atomic_ordinal
+                              << " object-index=" << *object_index
+                              << " prototype=" << prototype_id;
+                    if (!metadata.value->object_name().empty())
+                        std::cout << " name=\"" << metadata.value->object_name() << '"';
+                    std::cout << '\n';
+                    }
+                    break; // The game uses the first Atomic with a valid object index.
+                }
+            }
+            ++atomic_ordinal;
+        }
+        ++clump_ordinal;
+    }
+}
+
 } // namespace
 
 int main(const int argc, char** argv) {
-    if (argc < 2 || argc > 4) {
-        std::cerr << "Usage: rws-info <file.rws> [--summary|--validate-types|--export-obj <directory>]\n";
+    if (argc < 2 || argc > 5) {
+        std::cerr << "Usage: rws-info <file.rws> [--summary|--instances|--validate-types|--export-obj <directory>|--export-scene-gltf <file.gltf>|--export-clump-gltf <offset> <file.gltf>]\n";
         return 2;
     }
     try {
@@ -148,6 +215,10 @@ int main(const int argc, char** argv) {
                           << std::right << std::setw(9) << item.count << std::setw(20) << item.bytes
                           << std::setw(11) << item.truncated << '\n';
             }
+            if (!document.scene_instances().empty())
+                std::cout << "CSF scene instances: " << document.scene_instances().size() << '\n';
+        } else if (mode == "--instances") {
+            print_instances(document);
         } else if (mode == "--validate-types") {
             ValidationStats stats;
             validate_types(document.chunks(), document.bytes(), stats);
@@ -161,6 +232,29 @@ int main(const int argc, char** argv) {
             std::uint64_t exported{};
             export_geometries(document.chunks(), document.bytes(), directory, exported);
             std::cout << "Exported " << exported << " geometries to " << directory.string() << '\n';
+        } else if (mode == "--export-scene-gltf" && argc == 4) {
+            const auto stats = rws::export_scene_gltf(
+                document.chunks(), document.scene_instances(), document.bytes(),
+                std::filesystem::path(argv[3]));
+            std::cout << "Exported assembled scene: " << stats.atomic_instances << " atomic meshes, "
+                      << stats.custom_instances << " resolved CSF instances, "
+                      << stats.unresolved_instances << " unresolved CSF instances, "
+                      << stats.world_sectors << " World sectors, " << stats.vertices << " vertices, "
+                      << stats.triangles << " triangles, " << stats.materials << " materials ("
+                      << stats.skipped << " skipped)\n";
+        } else if (mode == "--export-clump-gltf" && argc == 5) {
+            const auto offset = std::stoull(argv[3], nullptr, 0);
+            const auto* clump = [&]() -> const rws::Chunk* {
+                for (const auto& chunk : document.chunks())
+                    if (chunk.type == 0x10 && chunk.offset == offset) return &chunk;
+                return nullptr;
+            }();
+            if (!clump) throw std::runtime_error("No top-level Clump found at the requested offset");
+            const auto stats = rws::export_clump_gltf(
+                *clump, document.bytes(), std::filesystem::path(argv[4]));
+            std::cout << "Exported Clump at 0x" << std::hex << offset << std::dec << ": "
+                      << stats.atomic_instances << " Atomics, " << stats.vertices << " vertices, "
+                      << stats.triangles << " triangles, " << stats.materials << " materials\n";
         } else {
             print_chunks(document.chunks());
         }

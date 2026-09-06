@@ -1,13 +1,13 @@
 #pragma once
 
-#include "rws/chunk.hpp"
-#include "rws/decoded.hpp"
+#include "rws/document.hpp"
 
 #include <imgui.h>
 
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -20,7 +20,9 @@ public:
     void draw(const rws::Chunk& geometry_chunk, std::span<const std::byte> bytes,
               const std::filesystem::path& source_path);
     void draw_scene(const std::vector<rws::Chunk>& chunks, std::span<const std::byte> bytes,
-                    const std::filesystem::path& source_path);
+                    std::span<const rws::SceneInstance> instances,
+                    const std::filesystem::path& source_path,
+                    std::optional<std::uint64_t>& selected_chunk);
 
 private:
     struct Face {
@@ -37,16 +39,21 @@ private:
     struct DrawBatch {
         std::uint16_t material{};
         std::uint32_t first{}, count{};
+        std::uint64_t owner_offset{};
+        bool force_opaque{};
     };
 
     bool load(const rws::Chunk& geometry_chunk, std::span<const std::byte> bytes,
               const std::filesystem::path& source_path);
     bool load_scene(const std::vector<rws::Chunk>& chunks, std::span<const std::byte> bytes,
+                    std::span<const rws::SceneInstance> instances,
                     const std::filesystem::path& source_path);
     void select_uv_set(std::size_t index);
     void reset_view();
+    void pan_camera(float delta_x, float delta_y);
     void update_keyboard_navigation();
     [[nodiscard]] rws::Vec3 camera_offset(float yaw, float pitch) const;
+    [[nodiscard]] std::optional<std::uint64_t> pick_scene(float mouse_x, float mouse_y) const;
     static void render_callback(const ImDrawList*, const ImDrawCmd* command);
     void render_gpu();
     bool create_gpu_resources();
@@ -55,7 +62,8 @@ private:
     std::uint64_t chunk_offset_{~std::uint64_t{}};
     bool scene_mode_{};
     std::size_t scene_clump_count_{}, scene_instance_count_{}, scene_world_sector_count_{},
-        scene_skipped_count_{};
+        scene_world_triangle_count_{}, scene_skipped_count_{}, scene_custom_instance_count_{},
+        scene_unresolved_instance_count_{};
     std::vector<rws::Vec3> vertices_;
     std::vector<std::vector<Uv>> uv_sets_;
     std::vector<Face> faces_;

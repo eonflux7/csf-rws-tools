@@ -72,6 +72,31 @@ int main() {
         assert(document.chunks()[1].children.size() == 1);
     }
     {
+        std::vector<std::byte> bytes;
+        append_header(bytes, 0x01, 0);
+        append_header(bytes, 0x16FC0, 99);
+        append_u32(bytes, 1001); append_u32(bytes, 42); append_f32(bytes, 5000.0F);
+        append_u32(bytes, 0); append_u32(bytes, 0); append_u32(bytes, 0x641);
+        append_header(bytes, 0x0D, 64);
+        append_header(bytes, 0x01, 52);
+        for (int i = 0; i < 9; ++i) append_f32(bytes, i % 4 == 0 ? 1.0F : 0.0F);
+        append_f32(bytes, 10.0F); append_f32(bytes, 20.0F); append_f32(bytes, 30.0F);
+        append_u32(bytes, 3);
+        append_u32(bytes, 7);
+        for (const char character : std::string("ARBOL_3"))
+            bytes.push_back(static_cast<std::byte>(character));
+        const auto world_offset = bytes.size();
+        append_header(bytes, 0x0B, 44);
+        append_header(bytes, 0x01, 0);
+        const auto document = rws::Document::from_bytes(std::move(bytes));
+        assert(document.scene_instances().size() == 1);
+        const auto& instance = document.scene_instances().front();
+        assert(instance.prototype_id == 1001 && instance.instance_id == 42);
+        assert(instance.prototype_name == "ARBOL_3" && instance.physical_size == 123);
+        assert(instance.position.x == 10.0F && instance.position.y == 20.0F && instance.position.z == 30.0F);
+        assert(document.chunks().size() == 2 && document.chunks()[1].offset == world_offset);
+    }
+    {
         constexpr std::uint32_t struct_size = 120;
         std::vector<std::byte> bytes;
         append_header(bytes, 0x0F, 12 + struct_size);
@@ -198,6 +223,29 @@ int main() {
         assert(data && data.value->arrays.size() == 2);
         assert(data.value->arrays[0].integers[0] == 42);
         assert(data.value->arrays[1].strings[0] == "test");
+    }
+    {
+        rws::PyroExtensionInfo metadata;
+        metadata.owner_type = 0x14;
+        metadata.words = {0x002A0009U};
+        assert(metadata.atomic_object_index() == 9);
+        metadata.words[0] = 0x002AFFFFU;
+        assert(!metadata.atomic_object_index());
+    }
+    {
+        std::vector<std::byte> bytes;
+        append_header(bytes, 0xFFFFFF00U, 15);
+        append_u32(bytes, 1); // World Sector schema version
+        append_u32(bytes, 1); // per-vertex byte array present
+        bytes.push_back(std::byte{0x10}); bytes.push_back(std::byte{0x20});
+        bytes.push_back(std::byte{0x30});
+        append_u32(bytes, 0x09); // first four bytes swallowed from the next header
+        const auto document = rws::Document::from_bytes(std::move(bytes));
+        const auto metadata = rws::decode_pyro_extension(
+            document.chunks()[0], 0x09, document.bytes());
+        assert(metadata && metadata.value->present);
+        assert(metadata.value->world_sector_vertex_bytes.size() == 3);
+        assert(metadata.value->world_sector_vertex_bytes[2] == 0x30);
     }
     {
         std::vector<std::byte> payload;

@@ -216,17 +216,66 @@ and extracting texture images remain future work.
 - Physical size: 28,979,398 bytes.
 - 244 standard top-level Clump chunks occupy `[0, 0x00DD9095)`.
 - Those clumps contain 369 geometries/atomics and 645 Texture chunks.
-- At `0x00DD9095`, a repeating CSF-specific region begins. Its first 12 bytes happen
-  to look like type `0x00016FC0`, size 99, and the normal library stamp, but the next
-  record does not start at the implied chunk boundary.
+- At `0x00DD9095`, a repeating CSF-specific scene-instance region begins. Each record
+  starts with type `0x00016FC0`, a custom declared size, and the normal library stamp.
 - The region is 14,458,929 bytes and contains embedded ordinary chunk headers,
   transforms, numeric IDs, and length-prefixed names such as `ARBOL_3`.
 
 The tail begins with 23 `ARBOL_3` instance records containing embedded Matrix
 chunks. At `0x00DD9BA2` they are followed by a standard RenderWare World chunk that
 extends to physical EOF (its declared size overruns the file by 32 bytes). The
-parser conservatively recovers this World when its stamp, leading Struct child, and
-EOF boundary all agree; the preceding instance records remain opaque.
+parser decodes the instance records and conservatively recovers this World when its
+stamp, leading Struct child, and EOF boundary all agree.
+
+### CSF scene-instance record (`0x00016FC0`)
+
+The executable's writer (`FUN_006C47C0`) and reader (`FUN_006C5660`) establish this
+layout. Offsets are relative to the outer record header:
+
+| Offset | Type | Meaning |
+|---:|---|---|
+| `0x00` | `u32` | custom type `0x00016FC0` |
+| `0x04` | `u32` | declared size, `92 + name_length` |
+| `0x08` | `u32` | RenderWare library ID |
+| `0x0C` | `u32` | prototype ID |
+| `0x10` | `u32` | instance ID |
+| `0x14` | `3 x f32` | optional Atomic parameters; semantics still unresolved |
+| `0x20` | `u32` | placement flags |
+| `0x24` | chunk | standard Matrix (`0x0D`, 64-byte payload) containing a 52-byte Struct |
+| `0x3C` | `9 x f32` | Matrix right/up/at basis |
+| `0x60` | `3 x f32` | Matrix position |
+| `0x6C` | `u32` | Matrix flags (observed as `3`) |
+| `0x70` | `u32` | name byte length |
+| `0x74` | bytes | non-null-terminated optional prototype name |
+
+The physical record length is `116 + name_length`, deliberately 24 bytes larger
+than the value in its size field. It therefore cannot be advanced using ordinary
+RenderWare `12 + declared_size` chunk framing.
+
+Prototype resolution is numeric, not name-based. `FUN_006C4090` subtracts 1000 from
+the record's prototype ID, `FUN_006C3C60` finds the first loaded Clump whose first
+valid Pyro Atomic object index matches that value, clones the entire Clump, copies
+the IDs/parameters/name/flags into runtime metadata, and applies the record Matrix
+to the clone's root frame. This is the same mapping used by the preview and glTF
+exporter; names such as `ARBOL_3` are metadata rather than lookup keys.
+The final transform call uses combination mode zero; its callee directly copies all
+16 matrix words, proving that the placement Matrix replaces (rather than post- or
+pre-concatenates) the cloned Clump root transform.
+
+### Pyro World Sector per-vertex data and size defect
+
+The full map corpus adds variable-size Pyro World Sector payloads absent from the
+original ST05 sample. The reader at `0x006BF6F0` reads a version, a presence word,
+then exactly one byte per World Sector vertex. `FUN_006BD470` later copies each byte
+into the high byte of a 16-bit field at offset six in an eight-byte runtime vertex
+record. Its finer gameplay/rendering meaning remains conservatively unnamed.
+
+The executable also proves a serializer defect: `PyroWorldSectorMetadataStreamGetSize`
+at `0x006BF6C0` reports `vertex_count + 12`, whereas the writer at `0x006BEEB0`
+emits only `vertex_count + 8` bytes. The declared plug-in payload therefore consumes
+the first four bytes of the following chunk header. This explains several apparent
+collision-World nesting/truncation anomalies; the decoder now excludes that
+four-byte over-declared tail instead of interpreting it as metadata.
 
 ### `ST05_COL.rws`
 

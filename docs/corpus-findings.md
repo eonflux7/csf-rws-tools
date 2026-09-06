@@ -1,8 +1,29 @@
 # Extracted-game RWS corpus
 
-Corpus root inspected: `C:\Users\eon\Desktop\Panzers`, 2026-09-05.
+Full resource root inspected: `C:\Users\eon\Desktop\CSF_unpacks`, 2026-09-05.
 
-## Inventory
+The complete unpacked set contains 410 `.rws` files totaling 295,884,822 bytes;
+all 410 load without a fatal parser error. Fourteen map streams contain 4,989 CSF
+scene-instance records. This count includes three identical campaign copies of the
+1,171-record FR01 map (`Parachut`, `Ransom`, and `Resist`). Every prototype ID used
+by all fourteen files correlates with a loaded Clump through the executable-derived
+`prototype ID = 1000 + first valid Pyro Atomic object index` rule.
+
+FR01 contains 1,171 placements: 382 named `ARBUSTO_A`, 59 named `ARBUSTO_B`, and
+730 unnamed records. The original standard stream has 419 Atomics; after prototype
+cloning, the assembled export contains 2,913 atomic meshes plus 40 World sectors.
+Thus the foliage missing from the earlier preview was not extra World geometry—it
+was this game-specific placement table.
+
+All 42 `.rws` files under a `Maps` directory pass the typed decoder sweep with zero
+failures and zero ambiguous Geometry triangle layouts. The wider scan also exposed
+variable-size Pyro World Sector per-vertex arrays and the executable's systematic
+four-byte size overstatement for that plug-in; the schema and serializer defect are
+documented in `rws-format.md`.
+
+## Panzers subset inventory
+
+The focused `Panzers` subset used for the original schema work contains:
 
 The archive contains 1,299 files, including 36 `.rws` files totaling 35,221,739
 bytes. All 36 load as bounded RenderWare streams. Only the already-known ST05 map

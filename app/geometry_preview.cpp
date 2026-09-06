@@ -153,6 +153,26 @@ rws::Vec3 transform_point(const AffineTransform& transform, const rws::Vec3 valu
             rotated.z + transform.position.z};
 }
 
+rws::Vec3 inverse_transform_point(const AffineTransform& transform, const rws::Vec3 value) {
+    const auto& m = transform.rotation;
+    const rws::Vec3 translated{value.x - transform.position.x, value.y - transform.position.y,
+                               value.z - transform.position.z};
+    const float c00 = m[4] * m[8] - m[5] * m[7];
+    const float c01 = m[2] * m[7] - m[1] * m[8];
+    const float c02 = m[1] * m[5] - m[2] * m[4];
+    const float determinant = m[0] * c00 + m[1] * (m[5] * m[6] - m[3] * m[8]) +
+                              m[2] * (m[3] * m[7] - m[4] * m[6]);
+    if (std::abs(determinant) < 1.0e-8F) return translated;
+    const float inverse = 1.0F / determinant;
+    return {(c00 * translated.x + c01 * translated.y + c02 * translated.z) * inverse,
+            ((m[5] * m[6] - m[3] * m[8]) * translated.x +
+             (m[0] * m[8] - m[2] * m[6]) * translated.y +
+             (m[2] * m[3] - m[0] * m[5]) * translated.z) * inverse,
+            ((m[3] * m[7] - m[4] * m[6]) * translated.x +
+             (m[1] * m[6] - m[0] * m[7]) * translated.y +
+             (m[0] * m[4] - m[1] * m[3]) * translated.z) * inverse};
+}
+
 AffineTransform compose(const AffineTransform& parent, const AffineTransform& local) {
     AffineTransform result;
     for (unsigned row = 0; row < 3; ++row)
@@ -342,6 +362,8 @@ void GeometryPreview::clear() {
     chunk_offset_ = ~std::uint64_t{};
     scene_mode_ = false;
     scene_clump_count_ = scene_instance_count_ = scene_world_sector_count_ = scene_skipped_count_ = 0;
+    scene_world_triangle_count_ = 0;
+    scene_custom_instance_count_ = scene_unresolved_instance_count_ = 0;
     vertices_.clear();
     uv_sets_.clear();
     faces_.clear();
@@ -389,11 +411,89 @@ void GeometryPreview::reset_view() {
     preserve_camera_position_ = false;
 }
 
+void GeometryPreview::pan_camera(const float delta_x, const float delta_y) {
+    const float focal = std::max(std::min(canvas_width_, canvas_height_) * 0.78F, 1.0F);
+    pan_x_ += delta_x / focal;
+    pan_y_ += delta_y / focal;
+}
+
 rws::Vec3 GeometryPreview::camera_offset(const float yaw, const float pitch) const {
     const float cy = std::cos(yaw), sy = std::sin(yaw);
     const float cp = std::cos(pitch), sp = std::sin(pitch);
-    return scene_mode_ ? rws::Vec3{cp * sy * distance_, sp * distance_, cp * cy * distance_} :
-                         rws::Vec3{cp * sy * distance_, cp * cy * distance_, sp * distance_};
+    const std::array<rws::Vec3, 3> rows = scene_mode_ ?
+        std::array<rws::Vec3, 3>{{{cy, 0, -sy}, {-sp * sy, cp, -sp * cy}, {cp * sy, sp, cp * cy}}} :
+        std::array<rws::Vec3, 3>{{{cy, -sy, 0}, {-sp * sy, -sp * cy, cp}, {cp * sy, cp * cy, sp}}};
+    const rws::Vec3 view_offset{-pan_x_ * distance_,
+                                pan_y_ * distance_,
+                                distance_};
+    return {rows[0].x * view_offset.x + rows[1].x * view_offset.y + rows[2].x * view_offset.z,
+            rows[0].y * view_offset.x + rows[1].y * view_offset.y + rows[2].y * view_offset.z,
+            rows[0].z * view_offset.x + rows[1].z * view_offset.y + rows[2].z * view_offset.z};
+}
+
+std::optional<std::uint64_t> GeometryPreview::pick_scene(const float mouse_x,
+                                                         const float mouse_y) const {
+    if (!scene_mode_ || canvas_width_ <= 0.0F || canvas_height_ <= 0.0F) return std::nullopt;
+    const float ndc_x = 2.0F * (mouse_x - canvas_x_) / canvas_width_ - 1.0F;
+    const float ndc_y = 1.0F - 2.0F * (mouse_y - canvas_y_) / canvas_height_;
+    const float aspect = canvas_width_ / canvas_height_;
+    constexpr float tan_half_fov = 0.46630766F; // tan(25 degrees)
+    rws::Vec3 view_direction{ndc_x * aspect * tan_half_fov, ndc_y * tan_half_fov, -1.0F};
+    const float view_length = std::sqrt(view_direction.x * view_direction.x +
+        view_direction.y * view_direction.y + 1.0F);
+    view_direction.x /= view_length; view_direction.y /= view_length;
+    view_direction.z /= view_length;
+
+    const float cy = std::cos(yaw_), sy = std::sin(yaw_);
+    const float cp = std::cos(pitch_), sp = std::sin(pitch_);
+    const std::array<rws::Vec3, 3> rows = scene_mode_ ?
+        std::array<rws::Vec3, 3>{{{cy, 0, -sy}, {-sp * sy, cp, -sp * cy}, {cp * sy, sp, cp * cy}}} :
+        std::array<rws::Vec3, 3>{{{cy, -sy, 0}, {-sp * sy, -sp * cy, cp}, {cp * sy, cp * cy, sp}}};
+    auto inverse_rotate = [&](const rws::Vec3 value) {
+        return rws::Vec3{rows[0].x * value.x + rows[1].x * value.y + rows[2].x * value.z,
+                         rows[0].y * value.x + rows[1].y * value.y + rows[2].y * value.z,
+                         rows[0].z * value.x + rows[1].z * value.y + rows[2].z * value.z};
+    };
+    const auto camera_from_target = camera_offset(yaw_, pitch_);
+    const rws::Vec3 origin{center_.x + navigation_offset_.x + camera_from_target.x,
+                           center_.y + navigation_offset_.y + camera_from_target.y,
+                           center_.z + navigation_offset_.z + camera_from_target.z};
+    const auto direction = inverse_rotate(view_direction);
+
+    float closest = std::numeric_limits<float>::max();
+    std::optional<std::uint64_t> result;
+    for (const auto& batch : draw_batches_) {
+        const auto end = static_cast<std::size_t>(batch.first) + batch.count;
+        for (std::size_t i = batch.first; i + 2 < end; i += 3) {
+            const auto& a = gpu_vertices_[i];
+            const auto& b = gpu_vertices_[i + 1];
+            const auto& c = gpu_vertices_[i + 2];
+            const rws::Vec3 edge1{b.x - a.x, b.y - a.y, b.z - a.z};
+            const rws::Vec3 edge2{c.x - a.x, c.y - a.y, c.z - a.z};
+            const rws::Vec3 p{direction.y * edge2.z - direction.z * edge2.y,
+                              direction.z * edge2.x - direction.x * edge2.z,
+                              direction.x * edge2.y - direction.y * edge2.x};
+            const float determinant = edge1.x * p.x + edge1.y * p.y + edge1.z * p.z;
+            if (std::abs(determinant) < 0.000001F) continue;
+            const float inverse_determinant = 1.0F / determinant;
+            const rws::Vec3 offset{origin.x - a.x, origin.y - a.y, origin.z - a.z};
+            const float u = (offset.x * p.x + offset.y * p.y + offset.z * p.z) * inverse_determinant;
+            if (u < 0.0F || u > 1.0F) continue;
+            const rws::Vec3 q{offset.y * edge1.z - offset.z * edge1.y,
+                              offset.z * edge1.x - offset.x * edge1.z,
+                              offset.x * edge1.y - offset.y * edge1.x};
+            const float v = (direction.x * q.x + direction.y * q.y + direction.z * q.z) *
+                inverse_determinant;
+            if (v < 0.0F || u + v > 1.0F) continue;
+            const float distance = (edge2.x * q.x + edge2.y * q.y + edge2.z * q.z) *
+                inverse_determinant;
+            if (distance > 0.0F && distance < closest) {
+                closest = distance;
+                result = batch.owner_offset;
+            }
+        }
+    }
+    return result;
 }
 
 void GeometryPreview::update_keyboard_navigation() {
@@ -620,7 +720,8 @@ bool GeometryPreview::load(const rws::Chunk& geometry_chunk,
     for (const auto face_index : face_order) {
         const auto& face = faces_[face_index];
         if (draw_batches_.empty() || draw_batches_.back().material != face.material)
-            draw_batches_.push_back({face.material, static_cast<std::uint32_t>(gpu_vertices_.size()), 0});
+            draw_batches_.push_back({face.material, static_cast<std::uint32_t>(gpu_vertices_.size()),
+                                     0, geometry_chunk.offset});
         const auto& a = vertices_[face.a];
         const auto& b = vertices_[face.b];
         const auto& c = vertices_[face.c];
@@ -651,6 +752,7 @@ bool GeometryPreview::load(const rws::Chunk& geometry_chunk,
 
 bool GeometryPreview::load_scene(const std::vector<rws::Chunk>& chunks,
                                  const std::span<const std::byte> bytes,
+                                 const std::span<const rws::SceneInstance> instances,
                                  const std::filesystem::path& source_path) {
     clear();
     scene_mode_ = true;
@@ -686,9 +788,16 @@ bool GeometryPreview::load_scene(const std::vector<rws::Chunk>& chunks,
         return id;
     };
 
+    struct PrototypeRange {
+        std::size_t batch_begin{}, batch_end{};
+        AffineTransform original_root;
+    };
+    std::unordered_map<std::uint32_t, PrototypeRange> prototypes;
     for (const auto& clump_chunk : chunks) {
         if (clump_chunk.type != 0x10) continue;
         ++scene_clump_count_;
+        const auto prototype_batch_begin = draw_batches_.size();
+        std::optional<std::uint32_t> prototype_id;
         const auto* frame_list_chunk = rws::find_child(clump_chunk, 0x0E);
         const auto* geometry_list_chunk = rws::find_child(clump_chunk, 0x1A);
         if (!frame_list_chunk || !geometry_list_chunk) {
@@ -726,6 +835,16 @@ bool GeometryPreview::load_scene(const std::vector<rws::Chunk>& chunks,
 
         for (const auto& atomic_chunk : clump_chunk.children) {
             if (atomic_chunk.type != 0x14) continue;
+            if (!prototype_id) {
+                const auto* extension = rws::find_child(atomic_chunk, 0x03);
+                const auto* pyro = extension ? rws::find_child(*extension, 0xFFFFFF00U) : nullptr;
+                const auto metadata = pyro ? rws::decode_pyro_extension(*pyro, 0x14, bytes) :
+                                             rws::DecodeResult<rws::PyroExtensionInfo>{};
+                if (metadata) {
+                    if (const auto index = metadata.value->atomic_object_index())
+                        prototype_id = 1000U + *index;
+                }
+            }
             const auto atomic = rws::decode_atomic(atomic_chunk, bytes);
             if (!atomic || atomic.value->frame_index < 0 || atomic.value->geometry_index < 0 ||
                 static_cast<std::size_t>(atomic.value->geometry_index) >= geometries.size() ||
@@ -843,9 +962,10 @@ bool GeometryPreview::load_scene(const std::vector<rws::Chunk>& chunks,
                     triangle.vertices[2] >= instance_vertices.size()) continue;
                 const auto local_material = std::min<std::size_t>(triangle.material, material_count - 1);
                 const auto global_material = material_base + local_material;
-                if (draw_batches_.empty() || draw_batches_.back().material != global_material)
+                if (draw_batches_.empty() || draw_batches_.back().material != global_material ||
+                    draw_batches_.back().owner_offset != clump_chunk.offset)
                     draw_batches_.push_back({static_cast<std::uint16_t>(global_material),
-                        static_cast<std::uint32_t>(gpu_vertices_.size()), 0});
+                        static_cast<std::uint32_t>(gpu_vertices_.size()), 0, clump_chunk.offset});
                 const auto& a = instance_vertices[triangle.vertices[0]];
                 const auto& b = instance_vertices[triangle.vertices[1]];
                 const auto& c = instance_vertices[triangle.vertices[2]];
@@ -869,10 +989,65 @@ bool GeometryPreview::load_scene(const std::vector<rws::Chunk>& chunks,
                 ++scene_instance_count_;
             }
         }
+        if (prototype_id && !prototypes.contains(*prototype_id) &&
+            draw_batches_.size() > prototype_batch_begin) {
+            AffineTransform original_root;
+            const auto root = std::find_if(frames.value->frames.begin(), frames.value->frames.end(),
+                [](const rws::FrameInfo& frame) { return frame.parent < 0; });
+            if (root != frames.value->frames.end()) {
+                const auto index = static_cast<std::size_t>(root - frames.value->frames.begin());
+                if (resolve_frame(resolve_frame, index)) original_root = world_frames[index];
+            }
+            prototypes[*prototype_id] = {prototype_batch_begin, draw_batches_.size(), original_root};
+        }
     }
 
-    // CSF stores the terrain as a RenderWare World after its small custom
-    // instance prefix. Document recovery exposes the World itself, while its
+    for (const auto& instance : instances) {
+        const auto found = prototypes.find(instance.prototype_id);
+        if (found == prototypes.end()) {
+            ++scene_unresolved_instance_count_;
+            continue;
+        }
+        const AffineTransform transform{{{
+            instance.rotation[0], instance.rotation[3], instance.rotation[6],
+            instance.rotation[1], instance.rotation[4], instance.rotation[7],
+            instance.rotation[2], instance.rotation[5], instance.rotation[8]}}, instance.position};
+        for (auto batch_index = found->second.batch_begin; batch_index < found->second.batch_end; ++batch_index) {
+            const auto source_batch = draw_batches_[batch_index];
+            DrawBatch output_batch{source_batch.material, static_cast<std::uint32_t>(gpu_vertices_.size()),
+                                   source_batch.count, instance.offset};
+            for (std::uint32_t i = 0; i < source_batch.count; ++i) {
+                auto vertex = gpu_vertices_[static_cast<std::size_t>(source_batch.first) + i];
+                const auto local = inverse_transform_point(found->second.original_root,
+                    {vertex.x, vertex.y, vertex.z});
+                const auto position = transform_point(transform, local);
+                vertex.x = position.x; vertex.y = position.y; vertex.z = position.z;
+                const auto local_normal = inverse_transform_point(found->second.original_root,
+                    {vertex.nx + found->second.original_root.position.x,
+                     vertex.ny + found->second.original_root.position.y,
+                     vertex.nz + found->second.original_root.position.z});
+                const auto& m = transform.rotation;
+                const rws::Vec3 normal{m[0] * local_normal.x + m[1] * local_normal.y + m[2] * local_normal.z,
+                                       m[3] * local_normal.x + m[4] * local_normal.y + m[5] * local_normal.z,
+                                       m[6] * local_normal.x + m[7] * local_normal.y + m[8] * local_normal.z};
+                const auto length = std::sqrt(normal.x * normal.x + normal.y * normal.y + normal.z * normal.z);
+                if (length > 0.0F) {
+                    vertex.nx = normal.x / length; vertex.ny = normal.y / length; vertex.nz = normal.z / length;
+                }
+                gpu_vertices_.push_back(vertex);
+                vertices_.push_back(position);
+                minimum.x = std::min(minimum.x, position.x); minimum.y = std::min(minimum.y, position.y);
+                minimum.z = std::min(minimum.z, position.z); maximum.x = std::max(maximum.x, position.x);
+                maximum.y = std::max(maximum.y, position.y); maximum.z = std::max(maximum.z, position.z);
+            }
+            for (std::uint32_t i = 0; i < source_batch.count / 3U; ++i) faces_.push_back({});
+            draw_batches_.push_back(output_batch);
+        }
+        ++scene_custom_instance_count_;
+    }
+
+    // CSF stores the terrain as a RenderWare World after its custom instance
+    // region. Document recovery exposes the World itself, while its
     // historically short sector/plugin payloads make declared-size BSP walking
     // unreliable. Locate leaves by their fully validated Struct layouts.
     const auto world_chunk = std::find_if(chunks.begin(), chunks.end(), [](const rws::Chunk& chunk) {
@@ -998,9 +1173,16 @@ bool GeometryPreview::load_scene(const std::vector<rws::Chunk>& chunks,
                         static_cast<std::int64_t>(material_window) + triangle.material,
                         0, static_cast<std::int64_t>(material_count - 1));
                     const auto global_material = material_base + static_cast<std::size_t>(local_material);
-                    if (draw_batches_.empty() || draw_batches_.back().material != global_material)
+                    if (draw_batches_.empty() || draw_batches_.back().material != global_material ||
+                        draw_batches_.back().owner_offset != world_chunk->offset)
+                    {
+                        const auto& texture_name = material_texture_names_[global_material];
+                        const bool floor_material = texture_name.size() >= 4 &&
+                            texture_name.compare(0, 4, "FFLR") == 0;
                         draw_batches_.push_back({static_cast<std::uint16_t>(global_material),
-                            static_cast<std::uint32_t>(gpu_vertices_.size()), 0});
+                            static_cast<std::uint32_t>(gpu_vertices_.size()), 0,
+                            world_chunk->offset, floor_material});
+                    }
                     const auto& a = sector_vertices[triangle.vertices[0]];
                     const auto& b = sector_vertices[triangle.vertices[1]];
                     const auto& c = sector_vertices[triangle.vertices[2]];
@@ -1024,6 +1206,7 @@ bool GeometryPreview::load_scene(const std::vector<rws::Chunk>& chunks,
                     }
                     faces_.push_back({});
                     draw_batches_.back().count += 3;
+                    ++scene_world_triangle_count_;
                 }
                 ++scene_world_sector_count_;
                 candidate = data + struct_size - 1U;
@@ -1107,6 +1290,7 @@ uniform bool uUseLightmap;
 uniform bool uLightmapOnly;
 uniform bool uUseDebugUv;
 uniform bool uApplyLighting;
+uniform bool uForceOpaque;
 uniform float uLightmapIntensity;
 uniform vec4 uBaseColor;
 out vec4 FragColor;
@@ -1119,6 +1303,7 @@ void main() {
         vec3 lit=lightmap.rgb*uLightmapIntensity;
         color=uLightmapOnly ? vec4(lit,1.0) : vec4(color.rgb*lit,color.a);
     }
+    if (uForceOpaque) color.a=1.0;
     if (color.a < 0.08) discard;
     FragColor=vec4(color.rgb*(uApplyLighting ? light : 1.0),color.a);
 })GLSL";
@@ -1214,9 +1399,8 @@ void GeometryPreview::render_gpu() {
     gl.bind_vertex_array(vertex_array_);
     gl.active_texture(gl_texture0);
 
-    const float focal = std::min(canvas_width_, canvas_height_) * 0.78F;
-    const float pan_world_x = pan_x_ * distance_ / std::max(focal, 1.0F);
-    const float pan_world_z = -pan_y_ * distance_ / std::max(focal, 1.0F);
+    const float pan_world_x = pan_x_ * distance_;
+    const float pan_world_z = -pan_y_ * distance_;
     const float near_plane = std::max(distance_ * 0.001F,
         std::max(radius_ * 0.000001F, 0.001F));
     const float navigation_distance = std::sqrt(navigation_offset_.x * navigation_offset_.x +
@@ -1244,6 +1428,7 @@ void GeometryPreview::render_gpu() {
     const GLint lightmap_only_location = gl.get_uniform_location(shader_program_, "uLightmapOnly");
     const GLint use_debug_uv_location = gl.get_uniform_location(shader_program_, "uUseDebugUv");
     const GLint base_color_location = gl.get_uniform_location(shader_program_, "uBaseColor");
+    const GLint force_opaque_location = gl.get_uniform_location(shader_program_, "uForceOpaque");
     gl.uniform_1f(gl.get_uniform_location(shader_program_, "uLightmapIntensity"), lightmap_intensity_);
     gl.uniform_1i(use_debug_uv_location, view_style_ == 3 || view_style_ == 4);
     gl.uniform_1i(gl.get_uniform_location(shader_program_, "uApplyLighting"), view_style_ < 3);
@@ -1281,6 +1466,7 @@ void GeometryPreview::render_gpu() {
             gl.uniform_1i(use_texture_location, texture != 0);
             gl.uniform_1i(use_lightmap_location, lightmap != 0);
             gl.uniform_1i(lightmap_only_location, view_style_ == 5);
+            gl.uniform_1i(force_opaque_location, batch.force_opaque);
             gl.active_texture(gl_texture0);
             glBindTexture(GL_TEXTURE_2D, texture);
             gl.active_texture(gl_texture1);
@@ -1291,6 +1477,7 @@ void GeometryPreview::render_gpu() {
     if (view_style_ == 7 || wireframe_) {
         gl.uniform_1i(use_texture_location, 0);
         gl.uniform_1i(use_lightmap_location, 0);
+        gl.uniform_1i(force_opaque_location, 1);
         const float color = view_style_ == 7 ? 0.84F : 0.09F;
         gl.uniform_4f(base_color_location, color, view_style_ == 7 ? 0.88F : 0.10F,
                       view_style_ == 7 ? 0.95F : 0.13F, 1.0F);
@@ -1390,8 +1577,7 @@ void GeometryPreview::draw(const rws::Chunk& geometry_chunk,
             preserve_camera_position_ = false;
         }
         if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
-            pan_x_ += io.MouseDelta.x;
-            pan_y_ += io.MouseDelta.y;
+            pan_camera(io.MouseDelta.x, io.MouseDelta.y);
         }
         if (io.MouseWheel != 0.0F) {
             const float minimum_distance = scene_mode_ ? std::max(radius_ * 0.0001F, 0.05F) :
@@ -1417,12 +1603,16 @@ void GeometryPreview::draw(const rws::Chunk& geometry_chunk,
 
 void GeometryPreview::draw_scene(const std::vector<rws::Chunk>& chunks,
                                  const std::span<const std::byte> bytes,
-                                 const std::filesystem::path& source_path) {
-    if (!scene_mode_) load_scene(chunks, bytes, source_path);
+                                 const std::span<const rws::SceneInstance> instances,
+                                 const std::filesystem::path& source_path,
+                                 std::optional<std::uint64_t>& selected_chunk) {
+    if (!scene_mode_) load_scene(chunks, bytes, instances, source_path);
 
-    ImGui::Text("Scene: %zu clumps | %zu atomic instances | %zu terrain sectors | %zu skipped",
-                scene_clump_count_, scene_instance_count_, scene_world_sector_count_, scene_skipped_count_);
-    ImGui::TextDisabled("Frame hierarchies and the recovered RenderWare World are included; 23 custom tree instances remain opaque.");
+    ImGui::Text("Scene: %zu clumps | %zu atomic instances | %zu terrain sectors (%zu triangles) | %zu skipped",
+                scene_clump_count_, scene_instance_count_, scene_world_sector_count_,
+                scene_world_triangle_count_, scene_skipped_count_);
+    ImGui::Text("CSF placements: %zu rendered | %zu unresolved",
+                scene_custom_instance_count_, scene_unresolved_instance_count_);
     constexpr std::array scene_styles{0, 1, 2, 5, 6, 7};
     constexpr const char* scene_style_names[] = {
         "Textured", "Material index", "Material color", "Lightmap texture",
@@ -1438,29 +1628,36 @@ void GeometryPreview::draw_scene(const std::vector<rws::Chunk>& chunks,
     if (view_style_ != 7) { ImGui::Checkbox("Wire overlay", &wireframe_); ImGui::SameLine(); }
     ImGui::Checkbox("Cull backfaces", &cull_backfaces_); ImGui::SameLine();
     if (ImGui::Button("Frame whole scene")) reset_view(); ImGui::SameLine();
-    if (ImGui::Button("Reload edited bytes")) load_scene(chunks, bytes, source_path);
+    if (ImGui::Button("Reload edited bytes")) load_scene(chunks, bytes, instances, source_path);
     ImGui::SetNextItemWidth(150.0F);
     ImGui::SliderFloat("Move speed", &navigation_speed_, 0.05F, 4.0F, "%.2fx",
                        ImGuiSliderFlags_Logarithmic);
     ImGui::SameLine();
     ImGui::TextDisabled("camera distance %.1f", distance_);
-    if (view_style_ == 0)
-        ImGui::Text("DDS files: %zu loaded | material slots unresolved: %zu",
-                    loaded_texture_count_, missing_texture_count_);
-    if (view_style_ == 5 || view_style_ == 6) {
-        ImGui::SetNextItemWidth(180.0F);
-        ImGui::SliderFloat("Lightmap intensity", &lightmap_intensity_, 0.25F, 4.0F);
-        const auto resolved = std::count_if(material_lightmap_textures_.begin(),
-            material_lightmap_textures_.end(), [](const unsigned int texture) { return texture != 0; });
-        ImGui::Text("Standard-clump MatFX lightmaps: %zu/%zu material slots",
-                    static_cast<std::size_t>(resolved), material_lightmap_textures_.size());
+    const float details_height = ImGui::GetTextLineHeightWithSpacing() * 3.0F;
+    if (ImGui::BeginChild("scene_style_details", {0.0F, details_height}, ImGuiChildFlags_None,
+                          ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
+        if (view_style_ == 0)
+            ImGui::Text("DDS files: %zu loaded | material slots unresolved: %zu",
+                        loaded_texture_count_, missing_texture_count_);
+        if (view_style_ == 5 || view_style_ == 6) {
+            ImGui::SetNextItemWidth(180.0F);
+            ImGui::SliderFloat("Lightmap intensity", &lightmap_intensity_, 0.25F, 4.0F);
+            const auto resolved = std::count_if(material_lightmap_textures_.begin(),
+                material_lightmap_textures_.end(), [](const unsigned int texture) { return texture != 0; });
+            ImGui::Text("Standard-clump MatFX lightmaps: %zu/%zu material slots",
+                        static_cast<std::size_t>(resolved), material_lightmap_textures_.size());
+        }
+        if (!texture_status_.empty()) ImGui::TextDisabled("%s", texture_status_.c_str());
     }
-    if (!texture_status_.empty()) ImGui::TextDisabled("%s", texture_status_.c_str());
-    ImGui::TextDisabled("WASD/QE: move | Left: look | Right: orbit | Middle: pan | Wheel: zoom | Shift: faster");
+    ImGui::EndChild();
+    ImGui::TextDisabled("Click: select Clump/World | Left drag: look | Right: orbit | WASD/QE: move | Wheel: zoom");
 
     const auto available = ImGui::GetContentRegionAvail();
     const ImVec2 size{std::max(available.x, 64.0F), std::max(available.y, 160.0F)};
     const auto origin = ImGui::GetCursorScreenPos();
+    canvas_x_ = origin.x; canvas_y_ = origin.y;
+    canvas_width_ = size.x; canvas_height_ = size.y;
     ImGui::InvisibleButton("scene_canvas", size,
         ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonMiddle | ImGuiButtonFlags_MouseButtonRight);
     auto* draw_list = ImGui::GetWindowDrawList();
@@ -1468,6 +1665,12 @@ void GeometryPreview::draw_scene(const std::vector<rws::Chunk>& chunks,
     draw_list->AddRect(origin, {origin.x + size.x, origin.y + size.y}, IM_COL32(70, 76, 88, 255));
     if (ImGui::IsItemHovered()) {
         const auto& io = ImGui::GetIO();
+        if (ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+            const auto drag = ImGui::GetMouseDragDelta(ImGuiMouseButton_Left);
+            if (drag.x * drag.x + drag.y * drag.y < 16.0F) {
+                if (const auto picked = pick_scene(io.MousePos.x, io.MousePos.y)) selected_chunk = *picked;
+            }
+        }
         if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) reset_view();
         if (ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
             target_yaw_ -= io.MouseDelta.x * 0.01F;
@@ -1480,8 +1683,7 @@ void GeometryPreview::draw_scene(const std::vector<rws::Chunk>& chunks,
             preserve_camera_position_ = false;
         }
         if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
-            pan_x_ += io.MouseDelta.x;
-            pan_y_ += io.MouseDelta.y;
+            pan_camera(io.MouseDelta.x, io.MouseDelta.y);
         }
         if (io.MouseWheel != 0.0F) {
             const float minimum_distance = scene_mode_ ? std::max(radius_ * 0.0001F, 0.05F) :
@@ -1495,8 +1697,6 @@ void GeometryPreview::draw_scene(const std::vector<rws::Chunk>& chunks,
         draw_list->AddText({origin.x + 12, origin.y + 12}, IM_COL32(255, 120, 90, 255), error_.c_str());
         return;
     }
-    canvas_x_ = origin.x; canvas_y_ = origin.y;
-    canvas_width_ = size.x; canvas_height_ = size.y;
     draw_list->AddCallback(render_callback, this);
     draw_list->AddCallback(ImDrawCallback_ResetRenderState, nullptr);
     const std::string statistics = std::to_string(vertices_.size()) + " transformed vertices | " +
